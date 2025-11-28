@@ -1,0 +1,6 @@
+version: 2
+
+models:
+  - name: master_ads
+  - name: master_ads_11272025
+  - name: reciprocal_ads
