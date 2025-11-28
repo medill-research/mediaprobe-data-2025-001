@@ -20,3 +20,8 @@ models:
     feature:
       +schema: feature
       +materialized: table
+    curated:
+      +schema: curated
+      +materialized: table
+    exports:
+      +materialized: external
