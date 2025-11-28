@@ -1,0 +1,7 @@
+version: 2
+
+models:
+  - name: export_master_ads
+  - name: export_master_ads_11272025
+  - name: export_reciprocal_ads
+  - name: export_reciprocal_ads_11272025
