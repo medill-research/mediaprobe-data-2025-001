@@ -1,0 +1,19 @@
+Raw_Table_Staging_Configurations:
+  DuckDB_File: "galvanic.duckdb"
+  Data_Staging:
+    Session_Metadata:
+      Source_File: "source/session_metadata.csv"
+      Staging_Table: "staging.session_metadata"
+      Schema_Name: "SessionMetadata"
+    Timeline_Metadata:
+      Source_File: "source/timeline_metadata.csv"
+      Staging_Table: "staging.timeline_metadata"
+      Schema_Name: "TimelineMetadata"
+    Ads_Metadata:
+      Source_File: "source/ads_metadata.csv"
+      Staging_Table: "staging.ads_metadata"
+      Schema_Name: "AdsMetadata"
+    Ads_Metadata_11272025:
+      Source_File: "source/ads_metadata_v2.csv"
+      Staging_Table: "staging.ads_metadata_11272025"
+      Schema_Name: "AdsMetadata11272025"
