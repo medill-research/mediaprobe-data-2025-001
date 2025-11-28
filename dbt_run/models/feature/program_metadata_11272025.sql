@@ -47,6 +47,7 @@ SELECT
     WT.phasic_program,
     WT.ars_program,
     AE.description AS ads_description,
+    AE.ads_comparison,
     AE.time_in AS ads_time_in,
     AE.time_out AS ads_time_out,
     AE.phasic_ads,

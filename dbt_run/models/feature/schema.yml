@@ -5,3 +5,5 @@ models:
   - name: ads_expanded_11272025
   - name: program_metadata
   - name: program_metadata_11272025
+  - name: vw_program_ranked
+  - name: vw_program_ranked_11272025
