@@ -1,0 +1,13 @@
+[project]
+name = "galvanic-skin"
+version = "1.0.0"
+description = "Analysis code for a study on how emotional responses (GSR + valence) transfer between media programming and ads, including bidirectional context effects and ad-position dynamics."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=1.4.2",
+    "polars>=1.35.2",
+    "pyarrow>=22.0.0",
+    "pydantic>=2.12.5",
+    "pyyaml>=6.0.3",
+]
