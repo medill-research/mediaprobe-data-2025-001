@@ -1,0 +1,22 @@
+name: "galvanic_skin_response"
+version: "1.0.0"
+profile: "galvanic-skin-response"
+
+# Configure dbt paths
+model-paths: ["models"]
+analysis-paths: ["analysis"]
+test-paths: ["test"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "logs"
+
+# Model configurations
+models:
+  galvanic_skin_response:
+    feature:
+      +schema: feature
+      +materialized: table

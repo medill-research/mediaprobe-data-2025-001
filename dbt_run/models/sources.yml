@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: galvanic_staging
+    database: galvanic
+    schema: staging
+    tables:
+      - name: ads_metadata
+      - name: ads_metadata_11272025
+      - name: timeline_metadata
+      - name: sesson_metadata
