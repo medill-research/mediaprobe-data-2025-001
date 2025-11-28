@@ -11,3 +11,7 @@ wheels/
 data
 .idea
 .DS_Store
+/dbt_run/logs/
+/dbt_run/target/
+dbt_run/.user.yml
+dbt_run/profiles.yml
