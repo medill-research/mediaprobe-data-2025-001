@@ -94,7 +94,7 @@ PROGRAM_MEAN AS (
 
 SELECT
     AB.session_id,
-    AB.segment_number,
+    AB.segment_number AS pod_number,
     AB.ad_position,
     AB.ads_description,
     SS.country AS program_country,

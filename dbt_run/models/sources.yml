@@ -8,4 +8,5 @@ sources:
       - name: ads_metadata
       - name: ads_metadata_11272025
       - name: timeline_metadata
+      - name: timeline_metadata_11272025
       - name: session_metadata

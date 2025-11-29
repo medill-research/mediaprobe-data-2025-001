@@ -65,7 +65,7 @@ PROGRAM_FEATURES AS (
         time_sequence,
         phasic_program,
         ars_program,
-        ROW_NUMBER() OVER (PARTITION BY session_id, segment_number ORDER BY time_sequence) AS row_ranking
+        ROW_NUMBER() OVER (PARTITION BY session_id, segment_number ORDER BY time_sequence DESC) AS row_ranking
 
     FROM {{ ref('vw_program_ranked_11272025') }}
 
@@ -95,7 +95,7 @@ PROGRAM_MEAN AS (
 
 SELECT
     AB.session_id,
-    AB.segment_number,
+    AB.segment_number AS pod_number,
     AB.ad_position,
     AB.ads_description,
     AB.ads_comparison,

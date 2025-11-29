@@ -54,7 +54,14 @@ ADS_FEATURES AS (
         ars_ads
 
     FROM (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY session_id, segment_number ORDER BY ad_position DESC) AS row_rank
+        SELECT
+            *,
+            ROW_NUMBER() OVER (
+                PARTITION BY session_id, segment_number ORDER BY time_sequence DESC
+            ) AS row_rank,
+            ROW_NUMBER() OVER (
+                PARTITION BY session_id, segment_number ORDER BY ad_position
+            ) AS ad_position
         FROM {{ ref('vw_program_ranked_11272025') }}
         WHERE ads_indicator = 1
     )
@@ -67,7 +74,7 @@ ADS_FEATURES AS (
 SELECT
     PM.session_id,
     PM.segment_number AS program_seg,
-    PM.segment_number - 1 AS ads_seg,
+    PM.segment_number - 1 AS pod_number,
     AF.ads_comparison,
     AF.ad_position,
     AF.phasic_ads AS prev_phasic_ads,
@@ -84,4 +91,4 @@ WHERE
 ORDER BY
     PM.session_id,
     program_seg,
-    ads_seg
+    pod_number
