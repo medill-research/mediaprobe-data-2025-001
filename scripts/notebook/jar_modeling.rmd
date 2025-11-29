@@ -1,0 +1,313 @@
+
+### Setup and Inputs
+
+```{r setup}
+
+rm(list = ls())
+gc()
+
+library("here")
+library("nanoparquet")
+library("lmerTest")
+library("performance")
+library("car")
+library("forcats")
+library("ggplot2")
+library("sandwich")
+library("lmtest")
+library("caret")
+library("forcats")
+library("dplyr")
+library("data.table")
+
+options(scipen=999)
+options(width = 200)
+options(DT.options = list(warn = FALSE))
+
+```
+
+
+```{r inputs}
+
+# Get folder location of the data
+folder_location <- here("data", "export")
+icoria_folder <- here("data", "icoria")
+
+# Read in primary ads data
+master_df <- fread(here(folder_location, "master_ads.csv"))
+master_df_11272025 <- fread(here(folder_location, "master_ads_11272025.csv"))
+
+# Read in reciprocal ads data
+reciprocal_df <- fread(here(folder_location, "reciprocal_ads.csv"))
+reciprocal_df_11272025 <- fread(here(folder_location, "reciprocal_ads_11272025.csv"))
+
+# Read in ICORIA source modeling data
+icoria_df <- fread(here(icoria_folder, "source_modeling.csv"))
+reciprocal_source <- read_parquet(here(icoria_folder, paste0("source_reciprocal.parquet")))
+
+```
+
+
+### Data Exploration
+
+```{r 11272025_data}
+
+# Modify master data with the correct factor level
+master_df <- master_df %>% 
+  mutate(program_format = factor(program_format)) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted")) %>% 
+  mutate(program_country = factor(program_country)) %>% 
+  mutate(program_country = fct_relevel(program_country, "US", "UK", "DE", "PT"))
+
+master_df_11272025 <- master_df_11272025 %>% 
+  mutate(program_format = factor(program_format)) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted")) %>% 
+  mutate(program_country = factor(program_country)) %>% 
+  mutate(program_country = fct_relevel(program_country, "US", "UK", "DE", "PT"))
+
+# Get a summary statistics for the new data source
+prop.table(table(master_df_11272025$ads_comparison))
+
+# Filter data from Round 2 to only rows that are labeled as Ads
+master_ads_11272025 <- master_df_11272025 %>% filter(tolower(ads_comparison) == "ads")
+reciprocal_ads_11272025 <- reciprocal_df_11272025 %>% filter(tolower(ads_comparison) == "ads")
+
+```
+
+
+```{r source_data}
+
+# Prepare the dataset from ICORIA and JAR to compare
+icoria_data <- icoria_df %>%
+  select(
+    session_id = session,
+    pod_number = ads_seg,
+    ad_position = ads_position,
+    prev_phasic_program = phasic_prog,
+    prev_ars_program = ars_prog,
+    prev_phasic_ads = phasic_ads_prev,
+    prev_ars_ads = ars_ads_prev,
+    repeated_ad,
+    phasic_ads,
+    ars_ads
+  )
+
+jar_data <- master_df %>% select(colnames(icoria_data))
+
+# Compare the data from the two sources
+compare_data <- jar_data %>% 
+  left_join(icoria_data, by = c("session_id", "pod_number", "ad_position")) %>%
+  filter(round(ars_ads.x - ars_ads.y, 0) != 0)
+
+# Compare the summary statistics of the two dataset
+summary(icoria_data)
+summary(jar_data)
+
+```
+
+
+```{r reciprocal_data}
+
+# Prepare the dataset for studying reciprocal effect from Round 1 and Round 2
+reciprocal_data <- reciprocal_source %>%
+  select(
+    session_id = session,
+    program_seg,
+    pod_number = ads_seg,
+    ad_position = ads_position,
+    prev_phasic_ads = phasic_ads,
+    prev_ars_ads = ars_ads,
+    phasic_program = phasic_prog,
+    ars_program = ars_prog
+  )
+
+jar_reciprocal <- reciprocal_df %>% select(colnames(reciprocal_data))
+
+# Check the summary statistics of the two datasets
+summary(reciprocal_data)
+summary(jar_reciprocal)
+
+```
+
+
+### Intercept Models
+
+```{r intercept_model_11272025_ads}
+
+# Intercept model for phasic measurement of ONLY ads
+phasic_intercept_11272025 <- lmer(
+  phasic_ads ~ pod_number + ad_position + prev_phasic_ads +
+    prev_phasic_program + factor(repeated_ad) + (1 | session_id),
+  data = master_ads_11272025
+)
+summary(phasic_intercept_11272025)
+
+# Intercept model for ars measurement of ads
+ars_intercept_11272025 <- lmer(
+  ars_ads ~ pod_number + ad_position + prev_ars_ads +
+    prev_ars_program + factor(repeated_ad) + (1 | session_id),
+  data = master_ads_11272025
+)
+summary(ars_intercept_11272025)
+
+```
+
+
+```{r intercept_model_11272025_all}
+
+# Intercept model for phasic measurement of ALL ads
+phasic_intercept_11272025 <- lmer(
+  phasic_ads ~ pod_number + ad_position + prev_phasic_ads +
+    prev_phasic_program + factor(repeated_ad) + (1 | session_id),
+  data = master_df_11272025
+)
+summary(phasic_intercept_11272025)
+
+# Intercept model for ars measurement of ALL ads
+ars_intercept_11272025 <- lmer(
+  ars_ads ~ pod_number + ad_position + prev_ars_ads +
+    prev_ars_program + factor(repeated_ad) + (1 | session_id),
+  data = master_df_11272025
+)
+summary(ars_intercept_11272025)
+
+```
+
+
+```{r reciprocal_11272025_ads}
+
+# Reciprocal intercept model for phasic measurement on ONLY ads
+reciprocal_phasic_11272025 <- lmer(
+  phasic_program ~ pod_number + ad_position + prev_phasic_ads + (1 | session_id),
+  data = reciprocal_ads_11272025
+)
+summary(reciprocal_phasic_11272025)
+
+# Reciprocal intercept model for ars measurement on ONLY ads
+reciprocal_ars_11272025 <- lmer(
+  ars_program ~ pod_number + ad_position + prev_ars_ads + (1 | session_id),
+  data = reciprocal_ads_11272025
+)
+summary(reciprocal_ars_11272025)
+
+```
+
+
+```{r reciprocal_11272025_all}
+
+# Reciprocal intercept model for phasic measurement on ALL ads
+reciprocal_phasic_11272025 <- lmer(
+  phasic_program ~ pod_number + ad_position + prev_phasic_ads + (1 | session_id),
+  data = reciprocal_df_11272025
+)
+summary(reciprocal_phasic_11272025)
+
+# Reciprocal intercept model for ars measurement on ALL ads
+reciprocal_ars_11272025 <- lmer(
+  ars_program ~ pod_number + ad_position + prev_ars_ads + (1 | session_id),
+  data = reciprocal_df_11272025
+)
+summary(reciprocal_ars_11272025)
+
+```
+
+
+```{r interaction_11272025_all}
+
+# Convert advertisement position to factor variable
+factor_df <- master_df_11272025 %>% 
+  mutate("ad_position" = ifelse(ad_position > 4, "5+", as.character(ad_position))) %>% 
+  mutate("ad_position" = factor(ad_position))
+
+# Intercept model for phasic with ad position and phasic program interaction
+phasic_interaction_11272025 <- lmer(
+  phasic_ads ~ pod_number + prev_phasic_ads + ad_position * prev_phasic_program +
+    factor(repeated_ad) + (1 | session_id),
+  data = factor_df
+)
+summary(phasic_interaction_11272025)
+
+# Intercept model for ars with ad position and ars program interaction
+ars_interaction_11272025 <- lmer(
+  ars_ads ~ pod_number + prev_ars_ads + ad_position * prev_ars_program +
+    factor(repeated_ad) + (1 | session_id),
+  data = factor_df
+)
+summary(ars_interaction_11272025)
+
+```
+
+
+```{r interaction_11272025_ads}
+
+# Convert advertisement position to factor variable
+factor_data <- master_ads_11272025 %>% 
+  mutate("ad_position" = ifelse(ad_position > 4, "5+", as.character(ad_position))) %>% 
+  mutate("ad_position" = factor(ad_position))
+
+# Intercept model for phasic with ad position and phasic program interaction
+phasic_interaction_11272025 <- lmer(
+  phasic_ads ~ pod_number + prev_phasic_ads + ad_position * prev_phasic_program +
+    factor(repeated_ad) + (1 | session_id),
+  data = factor_data
+)
+summary(phasic_interaction_11272025)
+
+# Intercept model for ars with ad position and ars program interaction
+ars_interaction_11272025 <- lmer(
+  ars_ads ~ pod_number + prev_ars_ads + ad_position * prev_ars_program +
+    factor(repeated_ad) + (1 | session_id),
+  data = factor_data
+)
+summary(ars_interaction_11272025)
+
+```
+
+
+### Non-intercept Models
+
+```{r regression_11252027_all}
+
+# Non-intercept model for ad phasic on ALL ad types
+phasic_regression_11272025 <- lm(
+  phasic_ads ~ pod_number + ad_position + prev_phasic_ads + prev_phasic_program +
+    program_country + age_average + females_pct + program_format +
+    program_format * prev_phasic_program,
+  data = master_ads_11272025
+)
+summary(phasic_regression_11272025)
+
+# Non-intercept model for ad ars on ALL ad types
+ars_regression_11272025 <- lm(
+  ars_ads ~ pod_number + ad_position + prev_ars_ads + prev_ars_program +
+    program_country + age_average + females_pct + program_format +
+    program_format * prev_ars_program,
+  data = master_ads_11272025
+)
+summary(ars_regression_11272025)
+
+```
+
+
+```{r regression_11252027_ads}
+
+# Non-intercept model for ad phasic on ONLY ads
+phasic_regression_11272025 <- lm(
+  phasic_ads ~ pod_number + ad_position + prev_phasic_ads + prev_phasic_program +
+    program_country + age_average + females_pct + program_format +
+    program_format * prev_phasic_program,
+  data = master_df_11272025
+)
+summary(phasic_regression_11272025)
+
+# Non-intercept model for ad ars on ONLY ads
+ars_regression_11272025 <- lm(
+  ars_ads ~ pod_number + ad_position + prev_ars_ads + prev_ars_program +
+    program_country + age_average + females_pct + program_format +
+    program_format * prev_ars_program,
+  data = master_df_11272025
+)
+summary(ars_regression_11272025)
+
+```
+
