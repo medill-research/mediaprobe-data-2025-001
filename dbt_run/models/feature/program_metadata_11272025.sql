@@ -5,14 +5,13 @@
     )
 }}
 
-{% set source_ads = source('galvanic_staging', 'timeline_metadata') %}
+{% set source_ads = source('galvanic_staging', 'timeline_metadata_11272025') %}
 
 WITH BASE_TABLE AS (
 
     SELECT
-        time_id,
         session_id,
-        time_stamp::TIME AS time_sequence,
+        time_stamp AS time_sequence,
         phasic_program,
         ars_program,
         quantile_cont(phasic_program::DOUBLE, 0.01) WITHIN GROUP (ORDER BY phasic_program) OVER () AS phasic_program_lower,
@@ -27,7 +26,6 @@ WITH BASE_TABLE AS (
 WINSORIZED_TABLE AS (
 
     SELECT
-        time_id,
         session_id,
         time_sequence,
         phasic_program,
