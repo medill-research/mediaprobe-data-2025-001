@@ -49,3 +49,7 @@ def load_staging_table(process_name: str) -> None:
         table_name=CONFIGS["Data_Staging"][process_name]["Staging_Table"].split(".")[-1],
         df=df
     )
+
+
+if __name__ == "__main__":
+    load_staging_table("Timeline_Metadata_11272025")

@@ -9,6 +9,10 @@ Raw_Table_Staging_Configurations:
       Source_File: "source/timeline_metadata.csv"
       Staging_Table: "staging.timeline_metadata"
       Schema_Name: "TimelineMetadata"
+    Timeline_Metadata_11272025:
+      Source_File: "source/timeline_metadata_11272025.csv"
+      Staging_Table: "staging.timeline_metadata_11272025"
+      Schema_Name: "TimelineMetadata11272025"
     Ads_Metadata:
       Source_File: "source/ads_metadata.csv"
       Staging_Table: "staging.ads_metadata"

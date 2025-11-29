@@ -33,6 +33,15 @@ class TimelineMetadata(BaseModel):
     ars_program: pl.Float64
 
 
+class TimelineMetadata11272025(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    session_id: pl.Int64
+    time_stamp: pl.Time
+    phasic_program: pl.Float64
+    ars_program: pl.Float64
+
+
 class AdsMetadata(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
