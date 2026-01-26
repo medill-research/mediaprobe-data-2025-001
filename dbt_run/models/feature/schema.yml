@@ -7,3 +7,5 @@ models:
   - name: program_metadata_11272025
   - name: vw_program_ranked
   - name: vw_program_ranked_11272025
+  - name: liwc_features
+  - name: vw_liwc_modeling

@@ -41,6 +41,8 @@ WINSORIZED_TABLE AS (
 
 SELECT
     WT.session_id,
+    AE.session_in,
+    AE.session_out,
     WT.time_sequence,
     WT.phasic_program,
     WT.ars_program,

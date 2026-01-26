@@ -45,6 +45,8 @@ WINSORIZED_DATA AS (
 
     SELECT
         session_id,
+        time_in As session_in,
+        time_out As session_out,
         description,
         ads_comparison,
         CASE
@@ -84,6 +86,8 @@ UNNEST_DIFF AS (
 
 SELECT
     session_id,
+    session_in,
+    session_out,
     time_in + INTERVAL (second_offset) SECOND AS time_sequence,
     description,
     ads_comparison,
