@@ -16,3 +16,4 @@ data
 dbt_run/.user.yml
 dbt_run/profiles.yml
 scripts/notebook/.Rhistory
+/logs
