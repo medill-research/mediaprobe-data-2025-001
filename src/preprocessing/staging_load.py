@@ -26,30 +26,40 @@ def load_staging_table(process_name: str) -> None:
     conn = duckdb.connect(database=duckdb_database)
 
     # Get data schema and column length
-    col_length = range(len(schemas.SOURCE_DATA[CONFIGS["Data_Staging"][process_name]["Schema_Name"]].model_fields))
-    model_cls = schemas.SOURCE_DATA[CONFIGS["Data_Staging"][process_name]["Schema_Name"]]
-    data_schema = {
-        name: field.annotation
-        for name, field in model_cls.model_fields.items()
-    }
+    if "Schema_Name" in CONFIGS["Data_Staging"][process_name]:
+        col_length = range(len(schemas.SOURCE_DATA[CONFIGS["Data_Staging"][process_name]["Schema_Name"]].model_fields))
+        model_cls = schemas.SOURCE_DATA[CONFIGS["Data_Staging"][process_name]["Schema_Name"]]
+        data_schema = {
+            name: field.annotation
+            for name, field in model_cls.model_fields.items()
+        }
 
-    # Read in the data from source file
-    df = pl.read_csv(
-        source=cf.DATA_PATH.joinpath(CONFIGS["Data_Staging"][process_name]["Source_File"]),
-        columns=col_length,
-        schema_overrides=data_schema,
-        try_parse_dates=True,
-        new_columns=[x for x in data_schema.keys()]
-    )
+        # Read in the data from source file
+        df = pl.read_csv(
+            source=cf.DATA_PATH.joinpath(CONFIGS["Data_Staging"][process_name]["Source_File"]),
+            columns=col_length,
+            schema_overrides=data_schema,
+            try_parse_dates=True,
+            new_columns=[x for x in data_schema.keys()]
+        )
+
+    else:
+        df = pl.read_csv(
+            source=cf.DATA_PATH.joinpath(CONFIGS["Data_Staging"][process_name]["Source_File"]),
+            try_parse_dates=True,
+            infer_schema_length=None
+        )
 
     # Truncate table and insert into DuckDB
     duckdb_utils.duckdb_insert(
         duckdb_engine=conn,
         schema_name=CONFIGS["Data_Staging"][process_name]["Staging_Table"].split(".")[0],
         table_name=CONFIGS["Data_Staging"][process_name]["Staging_Table"].split(".")[-1],
-        df=df
+        df=df,
+        full_load=CONFIGS["Data_Staging"][process_name]["Full_Load"]
     )
+    conn.close()
 
 
 if __name__ == "__main__":
-    load_staging_table("Timeline_Metadata_11272025")
+    load_staging_table("LIWC_Metadata")
