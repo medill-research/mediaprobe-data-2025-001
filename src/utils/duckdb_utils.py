@@ -72,43 +72,51 @@ def duckdb_insert(
     df: pl.DataFrame,
     delete_execution: bool = True,
     delete_string: str | None = None,
+    full_load: bool = False
 ) -> None:
     """
-    Inserts data from a Polars DataFrame into a DuckDB table. Optionally, it can execute a DELETE
-    statement on the target table before inserting the data.
+    Executes data insertion into DuckDB tables with optional deletion and full table reload functionalities.
 
-    The method performs two main operations:
-    1. Deletes existing rows in the table, either fully or conditionally, based on the provided arguments.
-    2. Inserts all rows from the provided DataFrame into the table.
-
-    This functionality is intended to streamline workflows involving modification of table content
-    using a combination of DELETE and INSERT operations.
+    This function facilitates inserting records from a given Polars DataFrame into a specified table
+    in DuckDB. It supports conditional deletion of existing records before insertion or alternatively
+    a full reload of the table.
 
     Args:
-        duckdb_engine (duckdb.DuckDBPyConnection): DuckDB connection used to execute SQL commands.
-        schema_name (str): Schema name where the target table resides.
-        table_name (str): Name of the target table for the operations.
-        df (pl.DataFrame): Polars DataFrame containing data to be inserted into the DuckDB table.
-        delete_execution (bool): Flag to indicate whether to perform DELETE operations before the
-            insertion. Defaults to True.
-        delete_string (str | None): An optional custom DELETE SQL command. This is executed only if
-            delete_execution is True. If None, a `DELETE FROM schema_name.table_name` statement
-            will be executed. Defaults to None.
+        duckdb_engine (duckdb.DuckDBPyConnection): A connection object to the DuckDB database.
+        schema_name (str): Name of the database schema where the table resides.
+        table_name (str): Name of the target table where data will be inserted.
+        df (pl.DataFrame): Polars DataFrame containing the data to be inserted.
+        delete_execution (bool, optional): A flag to indicate whether to execute DELETE statements prior
+            to insertion. Defaults to True.
+        delete_string (str | None, optional): Custom DELETE SQL string to execute. If not specified, a
+            DELETE FROM statement targeting the entire table will be executed. Defaults to None.
+        full_load (bool, optional): If True, the target table is entirely replaced with the data from
+            the provided DataFrame. Defaults to False.
 
     Raises:
-        ValueError: If the provided DataFrame (`df`) is empty.
+        ValueError: If the provided DataFrame is empty.
     """
 
-    # Execute DELETE statement if user specified
-    if delete_execution:
-        if delete_string is None:
-            duckdb_engine.sql(f"DELETE FROM {schema_name}.{table_name};")
-        else:
-            duckdb_engine.sql(delete_string)
+    if not full_load:
+        # Execute DELETE statement if user specified
+        if delete_execution:
+            if delete_string is None:
+                duckdb_engine.sql(f"DELETE FROM {schema_name}.{table_name};")
+            else:
+                duckdb_engine.sql(delete_string)
 
-    # Make sure that the dataframe provided is not empty
-    if df.is_empty():
-        raise ValueError("The dataframe provided must not be empty.")
+        # Make sure that the dataframe provided is not empty
+        if df.is_empty():
+            raise ValueError("The dataframe provided must not be empty.")
 
-    # Execute INSERT statement to insert data into DuckDB
-    duckdb_engine.sql(f"INSERT INTO {schema_name}.{table_name} BY NAME SELECT * FROM df")
+        # Execute INSERT statement to insert data into DuckDB
+        duckdb_engine.sql(f"INSERT INTO {schema_name}.{table_name} BY NAME SELECT * FROM df")
+
+    else:
+        query_string = (
+            f"""
+            DROP TABLE IF EXISTS {schema_name}.{table_name};
+            CREATE TABLE {schema_name}.{table_name} AS SELECT * FROM df;
+            """
+        )
+        duckdb_engine.execute(query_string)
