@@ -11,3 +11,4 @@ sources:
       - name: timeline_metadata_11272025
       - name: session_metadata
       - name: liwc_metadata
+      - name: emotion_predictions
