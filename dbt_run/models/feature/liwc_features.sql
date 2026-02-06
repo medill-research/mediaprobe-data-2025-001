@@ -8,7 +8,7 @@
 {% set source_ads = source('galvanic_staging', 'liwc_metadata') %}
 
 WITH LIWC_METADATA AS (
-    SELECT * FROM {{ source_ads}}
+    SELECT * FROM {{ source_ads }}
 ),
 
 AS_VARCHAR AS (
