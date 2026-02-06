@@ -5,11 +5,15 @@ description = "Analysis code for a study on how emotional responses (GSR + valen
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.12.0",
     "dbt-core>=1.10.15",
     "dbt-duckdb>=1.10.0",
     "duckdb>=1.4.2",
+    "openai>=2.15.0",
     "polars>=1.35.2",
     "pyarrow>=22.0.0",
     "pydantic>=2.12.5",
     "pyyaml>=6.0.3",
+    "torch>=2.10.0",
+    "transformers>=5.0.0",
 ]
