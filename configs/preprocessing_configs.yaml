@@ -30,3 +30,19 @@ Raw_Table_Staging_Configurations:
       Source_File: "source/2-final_LIWC_merged_with_ads_and_sessionmeta__with_MediaScope.csv"
       Staging_Table: "staging.liwc_metadata"
       Full_Load: True
+
+Text_Preprocessing_Configurations:
+  DuckDB_File: "galvanic.duckdb"
+  Transcript_Source_Table: "staging.liwc_metadata"
+  Ollama_Endpoint: "http://localhost:11434/v1"
+  Emotion_Classifier_Model:
+    Model_Name: "SamLowe/roberta-base-go_emotions"
+    Model_Source: "Hugging Face"
+    Output_Table: "staging.emotion_predictions"
+  Ads_Categorization_Model:
+    Ollama_Parameters:
+      model: "gpt-oss:120b"
+      max_tokens: 32768
+      temperature: 1.0
+      top_p: 1.0
+    Output_Table: "staging.ads_predictions"
