@@ -1,0 +1,832 @@
+
+### Setup and Inputs
+
+```{r setup}
+
+rm(list = ls())
+gc()
+
+library("tidyr")
+library("lmerTest")
+library("moments")
+library("here")
+library("ggplot2")
+library("scales")
+library("dplyr")
+library("data.table")
+library("tidymodels")
+library("rsample")
+library("finetune")
+library("forcats")
+library("vip")
+library("xgboost")
+library("pdp")
+library("patchwork")
+
+options(scipen=999)
+options(width = 200)
+options(DT.options = list(warn = FALSE))
+
+```
+
+
+```{r inputs}
+
+# Get folder location of the data
+folder_location <- here("data", "export")
+model_folder <- here("data", "models")
+
+# Read in the primary data used for Galvanic II modeling
+source_df <- fread(here(folder_location, "ads_us.csv"))
+full_df <- fread(here(folder_location, "ads_us_full.csv"))
+emotion_df <- fread(here(folder_location, "ads_us_emotions.csv"))
+
+# Preliminary preparation and defining columns for feature engineering
+FIXED_COLUMNS <- c(
+  "session_id", "session_in", "session_out", "phasic_ads", "ars_ads",
+  "ads_comparison", "segment_number", "ad_position", "program_country",
+  "age_average", "females_pct"
+)
+IDENT_COLUMNS <- c("session_id", "session_in", "session_out")
+
+modeling_df <- source_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+modeling_full_df <- full_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+emotion_full_df <- emotion_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+```
+
+
+### Features Engineering
+
+```{r skewness_check}
+
+# Calculate skewness for all columns that require possible transformation
+skewness_summary <- modeling_df %>% 
+  select(-all_of(FIXED_COLUMNS)) %>% 
+  select(where(is.numeric)) %>% 
+  summarize(across(everything(), ~skewness(., na.rm = TRUE))) %>% 
+  pivot_longer(everything(), names_to = "features", values_to = "skewness") %>% 
+  mutate(abs_skewness = abs(skewness)) %>% 
+  arrange(desc(abs_skewness))
+skewness_summary
+
+# Quick check on some of the skewed columns
+ggplot(modeling_df, aes(x = filler)) +
+  geom_histogram(fill = "steel blue") +
+  xlab("filler") +
+  ylab("Count") +
+  ggtitle("Histogram of filler") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(label=comma)
+
+ggplot(modeling_df, aes(x = ethnicity_EN)) +
+  geom_histogram(fill = "steel blue") +
+  xlab("ethnicity_EN") +
+  ylab("Count") +
+  ggtitle("Histogram of ethnicity_EN") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(label=comma)
+
+ggplot(modeling_df, aes(x = neutrality_pct)) +
+  geom_histogram(fill = "steel blue") +
+  xlab("neutrality_pct") +
+  ylab("Count") +
+  ggtitle("Histogram of neutrality_pct") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(label=comma)
+
+ggplot(modeling_df, aes(x = Dic_EN)) +
+  geom_histogram(fill = "steel blue") +
+  xlab("Dic_EN") +
+  ylab("Count") +
+  ggtitle("Histogram of Dic_EN") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(label=comma)
+
+ggplot(modeling_df, aes(x = time)) +
+  geom_histogram(fill = "steel blue") +
+  xlab("time") +
+  ylab("Count") +
+  ggtitle("Histogram of time") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_y_continuous(label=comma)
+
+```
+
+
+```{r inflated_zero}
+
+# Check for columns that have inflated zeroes
+inflated_zeroes <- modeling_df %>% 
+  select(-all_of(FIXED_COLUMNS)) %>% 
+  select(where(is.numeric)) %>% 
+  summarize(across(everything(), ~mean(.x == 0, na.rm = TRUE))) %>% 
+  pivot_longer(everything(), names_to = "features", values_to = "zero_pct") %>% 
+  arrange(desc(zero_pct))
+inflated_zeroes
+
+```
+
+
+Data Transformation Rules:
+  1.) Remove columns with ≥ 95% zeros
+  2.) Convert columns with 80-95% zeros to binary
+  3.) Calculate skewness on REMAINING continuous columns
+  4.) Log-transform columns with skewness > 1
+  5.) Reflection log-transform columns with skewness < -1
+
+
+### Gradient Boosting - Full Dataset
+
+```{r data_preparation}
+
+# Define columns to leave out and the modify some of the other columns
+remove_cols <- c("ads_comparison", "program_country")
+xgb_df <- modeling_full_df %>% 
+  select(-all_of(IDENT_COLUMNS)) %>% 
+  select(-all_of(remove_cols))
+
+# Split the data into training and testing sets
+set.seed(3825)
+phasic_split <- initial_split(xgb_df %>% select(-ars_ads), prop = 0.8, strata = phasic_ads)
+
+set.seed(3825)
+ars_split <- initial_split(xgb_df %>% select(-phasic_ads), prop = 0.8, strata = ars_ads)
+
+phasic_train <- training(phasic_split)
+phasic_test <- testing(phasic_split)
+
+ars_train <- training(ars_split)
+ars_test <- testing(ars_split)
+
+```
+
+
+```{r trainer_preparation}
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_ads ~ ., data = phasic_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_ads ~ ., data = ars_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(5, 40)),
+    learn_rate = learn_rate(range = c(-2, -0.5)),
+    loss_reduction = loss_reduction(range = c(-3, 1)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% 
+  add_recipe(phasic_recipe) %>% 
+  add_model(xgb_spec)
+ars_workflow <- workflow() %>% 
+  add_recipe(ars_recipe) %>% 
+  add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_train, v = 10, strata = phasic_ads)
+ars_cv <- vfold_cv(ars_train, v = 10, strata = ars_ads)
+
+```
+
+
+```{r bayes_tuning}
+
+# Create a helper function to save tuned XGBoost models
+xgb_tuning <- function(workflow, resamples, param_info, cache_path, seed = 3825) {
+  
+  # Create the directory if needed
+  cache_dir <- dirname(cache_path)
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE)
+    message("Created folder: ", cache_dir)
+  }
+  
+  # Check cache
+  if (file.exists(cache_path)) {
+    message("Loading cached model from: ", cache_path)
+    return(readRDS(cache_path))
+  }
+  
+  # Run tuning
+  message("Running Bayesian tuning...")
+  set.seed(seed)
+  tuned_result <- tune_bayes(
+    workflow,
+    resamples = resamples,
+    initial = 15,
+    iter = 30,
+    param_info = param_info,
+    metrics = metric_set(rmse, rsq),
+    control = control_bayes(verbose = TRUE, no_improve = 10)
+  )
+  
+  # Save and return
+  saveRDS(tuned_result, cache_path)
+  message("Saved tuned model to: ", cache_path)
+  return(tuned_result)
+  
+}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_tuned.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_tuned.rds")
+)
+
+```
+
+
+```{r model_selection}
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_train)
+xgb_ars <- fit(ars_selected, data = ars_train)
+
+```
+
+
+```{r variable_importance}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+### Gradient Boosting - Emotion Dataset
+
+```{r data_preparation}
+
+# Define columns to leave out and the modify some of the other columns
+remove_cols <- c("ads_comparison", "program_country", "ads_duration")
+xgb_df <- emotion_full_df %>% 
+  filter(ads_duration >= 15000) %>%    # Filter to only ads that are more than 15 seconds long
+  select(-all_of(IDENT_COLUMNS)) %>% 
+  select(-all_of(remove_cols))
+
+# Split the data into training and testing sets
+set.seed(3825)
+phasic_split <- initial_split(xgb_df %>% select(-ars_ads), prop = 0.8, strata = phasic_ads)
+
+set.seed(3825)
+ars_split <- initial_split(xgb_df %>% select(-phasic_ads), prop = 0.8, strata = ars_ads)
+
+phasic_train <- training(phasic_split)
+phasic_test <- testing(phasic_split)
+
+ars_train <- training(ars_split)
+ars_test <- testing(ars_split)
+
+```
+
+
+```{r trainer_preparation}
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_ads ~ ., data = phasic_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_ads ~ ., data = ars_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(5, 40)),
+    learn_rate = learn_rate(range = c(-2, -0.5)),
+    loss_reduction = loss_reduction(range = c(-3, 1)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% 
+  add_recipe(phasic_recipe) %>% 
+  add_model(xgb_spec)
+ars_workflow <- workflow() %>% 
+  add_recipe(ars_recipe) %>% 
+  add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_train, v = 10, strata = phasic_ads)
+ars_cv <- vfold_cv(ars_train, v = 10, strata = ars_ads)
+
+```
+
+
+```{r hyperparameters_tuning}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_emotion_tuned.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_emotion_tuned.rds")
+)
+
+```
+
+
+```{r model_selection}
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_train)
+xgb_ars <- fit(ars_selected, data = ars_train)
+
+```
+
+
+```{r variable_importance}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+### Random Effect Model + XGB
+
+```{r random_effect}
+
+# Prepare the data to fit a random effect model
+random_df <- modeling_full_df %>% 
+  select(
+    session_id, session_in, session_out, phasic_ads, ars_ads, segment_number,
+    ad_position, program_format, age_average, females_pct
+  ) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted"))
+
+# Fit LMER to control for fixed effects
+control_phasic <- lmer(
+  phasic_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+summary(control_phasic)
+
+control_ars <- lmer(
+  ars_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+summary(control_ars)
+
+# Add the residuals back into the dataset
+random_df <- random_df %>% 
+  mutate(
+    "phasic_resid" = residuals(control_phasic),
+    "ars_resid" = residuals(control_ars)
+  )
+
+```
+
+
+```{r data_preparation}
+
+# Define columns to leave out and the modify some of the other columns
+remove_cols <- c(
+  "ads_comparison", "program_country", "segment_number", "ad_position",
+  "program_format", "age_average", "females_pct", "phasic_ads", "ars_ads"
+)
+xgb_df <- modeling_full_df %>%
+  left_join(
+    random_df %>% select(session_id, session_in, session_out, phasic_resid, ars_resid),
+    by = c("session_id", "session_in", "session_out")
+  ) %>% 
+  select(-all_of(IDENT_COLUMNS)) %>% 
+  select(-all_of(remove_cols))
+
+# Split the data into training and testing sets
+set.seed(3825)
+phasic_split <- initial_split(xgb_df %>% select(-ars_resid), prop = 0.8, strata = phasic_resid)
+
+set.seed(3825)
+ars_split <- initial_split(xgb_df %>% select(-phasic_resid), prop = 0.8, strata = ars_resid)
+
+phasic_train <- training(phasic_split)
+phasic_test <- testing(phasic_split)
+
+ars_train <- training(ars_split)
+ars_test <- testing(ars_split)
+
+```
+
+
+```{r trainer_preparation}
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_resid ~ ., data = phasic_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_resid ~ ., data = ars_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% 
+  add_recipe(phasic_recipe) %>% 
+  add_model(xgb_spec)
+ars_workflow <- workflow() %>% 
+  add_recipe(ars_recipe) %>% 
+  add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_train, v = 10, strata = phasic_resid)
+ars_cv <- vfold_cv(ars_train, v = 10, strata = ars_resid)
+
+```
+
+
+```{r hyperparameters_tuning}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_tuned_control.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_tuned_control.rds")
+)
+
+```
+
+
+```{r model_selection}
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_train)
+xgb_ars <- fit(ars_selected, data = ars_train)
+
+```
+
+
+```{r variable_importance}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r pdp_analysis}
+
+# Extract the fitted model from your workflow
+phasic_fit <- extract_fit_parsnip(xgb_phasic)
+ars_fit <- extract_fit_parsnip(xgb_ars)
+
+# Prep training data through the recipe
+phasic_baked <- phasic_recipe %>% prep() %>% bake(new_data = phasic_train)
+ars_baked <- ars_recipe %>% prep() %>% bake(new_data = ars_train)
+
+# Helper function to generate PDP plots
+generate_pdp_plots <- function(fit, baked_data, target_col, features, color) {
+  pdp_plots <- lapply(features, function(feat) {
+    partial(
+      fit$fit,
+      pred.var = feat,
+      train = as.data.frame(baked_data %>% select(-all_of(target_col))),
+      plot = FALSE
+    )
+  })
+  
+  plot_list <- lapply(seq_along(features), function(i) {
+    ggplot() +
+      geom_line(data = pdp_plots[[i]], 
+                aes(x = .data[[features[i]]], y = yhat),
+                color = color, linewidth = 1) +
+      geom_rug(data = baked_data, 
+               aes(x = .data[[features[i]]]),
+               alpha = 0.1, sides = "b") +
+      labs(title = features[i], y = "Partial Dependence") +
+      theme_minimal()
+  })
+  
+  wrap_plots(plot_list, ncol = 3)
+}
+
+# Phasic PDP
+phasic_tone_features <- c(
+  "neutrality_pct", "shehe", "happiness_pct", "reward_EN",
+  "Culture_EN", "Conversation_EN", "affiliation_EN", "sadness_pct"
+)
+generate_pdp_plots(phasic_fit, phasic_baked, "phasic_resid", phasic_tone_features, "steelblue")
+
+# Ars PDP
+ars_tone_features <- c(
+  "health", "wc", "avg_valence", "det_EN", "illness_EN",
+  "neutrality_pct", "function_EN", "politic_EN", "happiness_pct"
+)
+generate_pdp_plots(ars_fit, ars_baked, "ars_resid", ars_tone_features, "darkorange")
+
+```
+
+
+### Roberta Testing
+
+```{r roberta_fit}
+
+# Define columns to leave out and the modify some of the other columns
+remove_cols <- c(
+  "ads_comparison", "program_country", "segment_number", "ad_position",
+  "program_format", "age_average", "females_pct", "phasic_ads", "ars_ads",
+  "ads_duration"
+)
+xgb_df <- emotion_full_df %>%
+  left_join(
+    random_df %>% select(session_id, session_in, session_out, phasic_resid, ars_resid),
+    by = c("session_id", "session_in", "session_out")
+  ) %>% 
+  select(-all_of(IDENT_COLUMNS)) %>% 
+  select(-all_of(remove_cols))
+
+phasic_train <- xgb_df %>% select(-ars_resid)
+ars_train <- xgb_df %>% select(-phasic_resid)
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_resid ~ ., data = phasic_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_resid ~ ., data = ars_train) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% 
+  add_recipe(phasic_recipe) %>% 
+  add_model(xgb_spec)
+ars_workflow <- workflow() %>% 
+  add_recipe(ars_recipe) %>% 
+  add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_train, v = 10, strata = phasic_resid)
+ars_cv <- vfold_cv(ars_train, v = 10, strata = ars_resid)
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_emotion_control.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_emotion_control.rds")
+)
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_train)
+xgb_ars <- fit(ars_selected, data = ars_train)
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+

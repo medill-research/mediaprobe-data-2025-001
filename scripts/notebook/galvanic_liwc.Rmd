@@ -1,0 +1,496 @@
+
+### Setup and Inputs
+
+```{r setup}
+
+rm(list = ls())
+gc()
+
+library("tidyr")
+library("lmerTest")
+library("moments")
+library("here")
+library("ggplot2")
+library("scales")
+library("dplyr")
+library("data.table")
+library("tidymodels")
+library("rsample")
+library("finetune")
+library("forcats")
+library("vip")
+library("xgboost")
+library("pdp")
+library("patchwork")
+
+options(scipen=999)
+options(width = 200)
+options(DT.options = list(warn = FALSE))
+
+```
+
+
+```{r inputs}
+
+# Get folder location of the data
+folder_location <- here("data", "export")
+model_folder <- here("data", "models")
+
+# Read in the primary data used for Galvanic II modeling
+source_df <- fread(here(folder_location, "ads_us.csv"))
+full_df <- fread(here(folder_location, "ads_us_full.csv"))
+emotion_df <- fread(here(folder_location, "ads_us_emotions.csv"))
+
+# Preliminary preparation and defining columns for feature engineering
+FIXED_COLUMNS <- c(
+  "session_id", "session_in", "session_out", "phasic_ads", "ars_ads",
+  "ads_comparison", "segment_number", "ad_position", "program_country",
+  "age_average", "females_pct"
+)
+IDENT_COLUMNS <- c("session_id", "session_in", "session_out")
+
+modeling_df <- source_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+modeling_full_df <- full_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+emotion_full_df <- emotion_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+```
+
+
+```{r bayes_tuning_function}
+
+# Create a helper function to save tuned XGBoost models
+xgb_tuning <- function(workflow, resamples, param_info, cache_path, seed = 3825) {
+  
+  # Create the directory if needed
+  cache_dir <- dirname(cache_path)
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE)
+    message("Created folder: ", cache_dir)
+  }
+  
+  # Check cache
+  if (file.exists(cache_path)) {
+    message("Loading cached model from: ", cache_path)
+    return(readRDS(cache_path))
+  }
+  
+  # Run tuning
+  message("Running Bayesian tuning...")
+  set.seed(seed)
+  tuned_result <- tune_bayes(
+    workflow,
+    resamples = resamples,
+    initial = 15,
+    iter = 30,
+    param_info = param_info,
+    metrics = metric_set(rmse, rsq),
+    control = control_bayes(verbose = TRUE, no_improve = 10)
+  )
+  
+  # Save and return
+  saveRDS(tuned_result, cache_path)
+  message("Saved tuned model to: ", cache_path)
+  return(tuned_result)
+  
+}
+
+```
+
+
+```{r pdp_function}
+
+generate_pdp_plots <- function(fit, baked_data, target_col, features, color) {
+  pdp_plots <- lapply(features, function(feat) {
+    partial(
+      fit$fit,
+      pred.var = feat,
+      train = as.data.frame(baked_data %>% select(-all_of(target_col))),
+      type = "regression",
+      plot = FALSE
+    )
+  })
+  
+  plot_list <- lapply(seq_along(features), function(i) {
+    ggplot() +
+      geom_line(data = pdp_plots[[i]], 
+                aes(x = .data[[features[i]]], y = yhat),
+                color = color, linewidth = 1) +
+      geom_rug(data = baked_data, 
+               aes(x = .data[[features[i]]]),
+               alpha = 0.1, sides = "b") +
+      labs(title = features[i], x = NULL, y = "Partial Dependence") +
+      scale_y_continuous(labels = scales::label_number(accuracy = 0.0001)) +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 9, face = "bold"),
+        plot.margin = margin(5, 10, 5, 10)
+      )
+  })
+  
+  wrap_plots(plot_list, ncol = 3)
+}
+
+```
+
+
+```{r control_model}
+
+# Prepare the data to fit a random effect model
+random_df <- modeling_full_df %>% 
+  select(
+    session_id, session_in, session_out, phasic_ads, ars_ads, segment_number,
+    ad_position, program_format, age_average, females_pct
+  ) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted"))
+
+# Fit LMER to control for fixed effects
+control_phasic <- lmer(
+  phasic_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+
+control_ars <- lmer(
+  ars_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+
+# Add the residuals back into the dataset
+random_df <- random_df %>% 
+  mutate(
+    "phasic_resid" = residuals(control_phasic),
+    "ars_resid" = residuals(control_ars)
+  )
+
+```
+
+
+### LMER + XGBoost: Full Model
+
+```{r data_preparation}
+
+# Define columns to leave out and the modify some of the other columns
+remove_cols <- c(
+  "ads_comparison", "program_country", "segment_number", "ad_position",
+  "program_format", "age_average", "females_pct", "phasic_ads", "ars_ads"
+)
+xgb_df <- modeling_full_df %>%
+  left_join(
+    random_df %>% select(session_id, session_in, session_out, phasic_resid, ars_resid),
+    by = c("session_id", "session_in", "session_out")
+  ) %>% 
+  select(-all_of(IDENT_COLUMNS)) %>% 
+  select(-all_of(remove_cols))
+
+# Split dataset for both phasic and ars
+phasic_df <- xgb_df %>% select(-ars_resid)
+ars_df <- xgb_df %>% select(-phasic_resid)
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_resid ~ ., data = phasic_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_resid ~ ., data = ars_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+```
+
+
+```{r trainer_preparation}
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% add_recipe(phasic_recipe) %>%  add_model(xgb_spec)
+ars_workflow <- workflow() %>% add_recipe(ars_recipe) %>% add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_df, v = 10, strata = phasic_resid)
+ars_cv <- vfold_cv(ars_df, v = 10, strata = ars_resid)
+
+```
+
+
+```{r hyperparameter_tuning}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_control_full.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_control_full.rds")
+)
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_df)
+xgb_ars <- fit(ars_selected, data = ars_df)
+
+```
+
+
+```{r variables_importance}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r pdp_plots}
+
+# Extract the fitted model from workflows
+phasic_fit <- extract_fit_parsnip(xgb_phasic)
+ars_fit <- extract_fit_parsnip(xgb_ars)
+
+# Prep training data through the recipe
+phasic_baked <- phasic_recipe %>% prep() %>% bake(new_data = phasic_df)
+ars_baked <- ars_recipe %>% prep() %>% bake(new_data = ars_df)
+
+# Phasic PDP
+phasic_tone_features <- c(
+  "avg_intonation_score", "auditory_EN", "neutrality_pct", "happiness_pct",
+  "emo_anx_EN", "emo_neg_EN", "visual_EN", "filler", "avg_speaking_rate"
+)
+generate_pdp_plots(phasic_fit, phasic_baked, "phasic_resid", phasic_tone_features, "steelblue")
+
+# Ars PDP
+ars_tone_features <- c(
+  "avg_intonation_score", "avg_valence", "avg_speaking_rate", "avg_loudness",
+  "happiness_pct", "neutrality_pct", "avg_fundamental_freq", "wc", "avg_activation"
+)
+generate_pdp_plots(ars_fit, ars_baked, "ars_resid", ars_tone_features, "darkorange")
+
+```
+
+
+### LIWC Summary Variables
+
+```{r gbm_model}
+
+# Create the recipes for this task for phasic and ars
+phasic_summary_df <- xgb_df %>% 
+  select(
+    "phasic_resid", "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+    "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+    "Perception_EN", "Conversation_EN"
+  ) %>% 
+  mutate(
+    across(
+      -phasic_resid,
+      ~ {
+        lower <- quantile(.x, 0.025, na.rm = TRUE)
+        upper <- quantile(.x, 0.975, na.rm = TRUE)
+        pmin(pmax(.x, lower), upper)
+      }
+    )
+  )
+
+ars_summary_df <- xgb_df %>% 
+  select(
+    "ars_resid", "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+    "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+    "Perception_EN", "Conversation_EN"
+  ) %>% 
+  mutate(
+    across(
+      -ars_resid,
+      ~ {
+        lower <- quantile(.x, 0.025, na.rm = TRUE)
+        upper <- quantile(.x, 0.975, na.rm = TRUE)
+        pmin(pmax(.x, lower), upper)
+      }
+    )
+  )
+
+phasic_recipe <- recipe(phasic_resid ~ ., data = phasic_summary_df) %>% 
+  step_dummy(
+    all_nominal_predictors(),
+    one_hot = TRUE
+  )
+
+ars_recipe <- recipe(ars_resid ~ ., data = ars_summary_df) %>% 
+  step_dummy(
+    all_nominal_predictors(),
+    one_hot = TRUE
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% add_recipe(phasic_recipe) %>%  add_model(xgb_spec)
+ars_workflow <- workflow() %>% add_recipe(ars_recipe) %>% add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_df, v = 10, strata = phasic_resid)
+ars_cv <- vfold_cv(ars_df, v = 10, strata = ars_resid)
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_control_summary.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_control_summary.rds")
+)
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_summary_df)
+xgb_ars <- fit(ars_selected, data = ars_summary_df)
+
+```
+
+
+```{r gbm_vip}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads: Top 20 Important Features",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r gbm_pdp}
+
+# Extract the fitted model from workflows
+phasic_fit <- extract_fit_parsnip(xgb_phasic)
+ars_fit <- extract_fit_parsnip(xgb_ars)
+
+# Prep training data through the recipe
+phasic_baked <- phasic_recipe %>% prep() %>% bake(new_data = phasic_summary_df)
+ars_baked <- ars_recipe %>% prep() %>% bake(new_data = ars_summary_df)
+
+# Phasic PDP
+phasic_tone_features <- c(
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+  "Perception_EN", "Conversation_EN"
+)
+generate_pdp_plots(phasic_fit, phasic_baked, "phasic_resid", phasic_tone_features, "steelblue")
+
+# Ars PDP
+ars_tone_features <- c(
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+  "Perception_EN", "Conversation_EN"
+)
+generate_pdp_plots(ars_fit, ars_baked, "ars_resid", ars_tone_features, "darkorange")
+
+
+# Intonation, speaking rate, loudness
+# Gender, Age
+# Happiness and Neutrality (need to look at this in more detailed level) - test individual emotion as well
+# Informational vs transformation
+# Include gender of the speaker
+# Major thing: Signaling theory
+
+
+# Two Model
+# 1.) GBM with all the above variables
+# 2.) Linear model (easier if no interaction, but harder if there are interactions)
+
+```
+
