@@ -1,0 +1,594 @@
+
+### Setup and Inputs
+
+```{r setup}
+
+rm(list = ls())
+gc()
+
+library("tidyr")
+library("lmerTest")
+library("moments")
+library("here")
+library("ggplot2")
+library("scales")
+library("dplyr")
+library("data.table")
+library("tidymodels")
+library("rsample")
+library("finetune")
+library("forcats")
+library("vip")
+library("xgboost")
+library("pdp")
+library("patchwork")
+library("shapviz")
+library("mice")
+library("mgcv")
+library("reshape2")
+
+options(scipen=999)
+options(width = 200)
+options(DT.options = list(warn = FALSE))
+
+```
+
+
+```{r inputs}
+
+# Get folder location of the data
+folder_location <- here("data", "export")
+model_folder <- here("data", "models")
+
+# Read in the primary data used for Galvanic II modeling
+source_df <- fread(here(folder_location, "ads_us.csv"))
+full_df <- fread(here(folder_location, "ads_us_full.csv"))
+emotion_df <- fread(here(folder_location, "ads_us_emotions.csv"))
+
+# Preliminary preparation and defining columns for feature engineering
+FIXED_COLUMNS <- c(
+  "session_id", "session_in", "session_out", "phasic_ads", "ars_ads",
+  "ads_comparison", "segment_number", "ad_position", "program_country",
+  "age_average", "females_pct"
+)
+IDENT_COLUMNS <- c("session_id", "session_in", "session_out")
+
+modeling_df <- source_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+modeling_full_df <- full_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+emotion_full_df <- emotion_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+```
+
+
+```{r bayes_tuning_function}
+
+# Create a helper function to save tuned XGBoost models
+xgb_tuning <- function(workflow, resamples, param_info, cache_path, seed = 3825) {
+  
+  # Create the directory if needed
+  cache_dir <- dirname(cache_path)
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE)
+    message("Created folder: ", cache_dir)
+  }
+  
+  # Check cache
+  if (file.exists(cache_path)) {
+    message("Loading cached model from: ", cache_path)
+    return(readRDS(cache_path))
+  }
+  
+  # Run tuning
+  message("Running Bayesian tuning...")
+  set.seed(seed)
+  tuned_result <- tune_bayes(
+    workflow,
+    resamples = resamples,
+    initial = 15,
+    iter = 30,
+    param_info = param_info,
+    metrics = metric_set(rmse, rsq),
+    control = control_bayes(verbose = TRUE, no_improve = 10)
+  )
+  
+  # Save and return
+  saveRDS(tuned_result, cache_path)
+  message("Saved tuned model to: ", cache_path)
+  return(tuned_result)
+  
+}
+
+```
+
+
+```{r pdp_function}
+
+generate_pdp_plots <- function(fit, baked_data, target_col, features, color) {
+  pdp_plots <- lapply(features, function(feat) {
+    partial(
+      fit$fit,
+      pred.var = feat,
+      train = as.data.frame(baked_data %>% select(-all_of(target_col))),
+      type = "regression",
+      plot = FALSE
+    )
+  })
+  
+  plot_list <- lapply(seq_along(features), function(i) {
+    ggplot() +
+      geom_line(data = pdp_plots[[i]], 
+                aes(x = .data[[features[i]]], y = yhat),
+                color = color, linewidth = 1) +
+      geom_rug(data = baked_data, 
+               aes(x = .data[[features[i]]]),
+               alpha = 0.1, sides = "b") +
+      labs(title = features[i], x = NULL, y = "Partial Dependence") +
+      scale_y_continuous(labels = scales::label_number(accuracy = 0.0001)) +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 9, face = "bold"),
+        plot.margin = margin(5, 10, 5, 10)
+      )
+  })
+  
+  wrap_plots(plot_list, ncol = 3)
+}
+
+```
+
+
+```{r interaction_matrix}
+
+get_interaction_table <- function(shap_int, prepped_data, top_n = 15) {
+  int_matrix <- shap_int$S_inter
+  n_features <- ncol(prepped_data)
+  feature_names <- colnames(prepped_data)
+  interaction_strength <- matrix(0, n_features, n_features)
+  
+  for (i in 1:n_features) {
+    for (j in 1:n_features) {
+      interaction_strength[i, j] <- mean(abs(int_matrix[, i, j]))
+    }
+  }
+  
+  rownames(interaction_strength) <- feature_names
+  colnames(interaction_strength) <- feature_names
+  
+  int_df <- melt(interaction_strength) %>%
+    mutate(Var1 = as.character(Var1), Var2 = as.character(Var2)) %>%
+    filter(Var1 < Var2) %>%
+    arrange(desc(value)) %>%
+    head(top_n)
+  
+  return(int_df)
+}
+
+```
+
+
+```{r dependence_plot}
+
+plot_shap_dependence <- function(
+    shap_obj, var,
+    color_var, 
+    title = NULL,
+    x_label = NULL,
+    color_label = NULL,
+    palette = "plasma"
+) {
+  
+  if (is.null(title)) title <- paste0("SHAP: ", var, " × ", color_var)
+  if (is.null(x_label)) x_label <- var
+  if (is.null(color_label)) color_label <- color_var
+  
+  sv_dependence(shap_obj, v = var, color_var = color_var) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "right"
+    ) +
+    labs(
+      title = title,
+      x = x_label,
+      y = "SHAP Value",
+      color = color_label
+    ) +
+    scale_color_viridis_c(option = palette)
+}
+
+```
+
+
+### Data Exploration
+
+```{r data_modification}
+
+# Create a dataset with subset of variables
+information_df <- modeling_full_df %>% 
+  select(
+    "session_id", "session_in", "session_out", "phasic_ads", "ars_ads",
+    "avg_intonation_score", "avg_speaking_rate", "avg_loudness",
+    "avg_male_confidence", "avg_estimated_age", "neutrality_pct", "happiness_pct"
+  ) %>% 
+  mutate(across(c("neutrality_pct", "happiness_pct"), ~ .x / 100))
+
+# Impute the missing values from average intonation and average speaking rate using MICE
+winsorize_vars <- c("avg_speaking_rate", "avg_loudness", "avg_intonation_score", "avg_estimated_age")
+imputed <- mice(information_df, m = 1, method = "pmm", seed = 3825)
+information_df <- complete(imputed) %>% 
+  mutate(
+    across(
+      all_of(winsorize_vars),
+      ~ case_when(
+        .x > quantile(.x, 0.995, na.rm = TRUE) ~ quantile(.x, 0.995, na.rm = TRUE),
+        .x < quantile(.x, 0.005, na.rm = TRUE) ~ quantile(.x, 0.005, na.rm = TRUE),
+        TRUE ~ .x
+      )
+    )
+  )
+
+```
+
+
+```{r data_visualization}
+
+# Examine the histogram for each of the variable
+vars <- c(
+  "phasic_ads", "ars_ads", "avg_intonation_score", "avg_speaking_rate", 
+  "avg_loudness", "avg_male_confidence", "avg_estimated_age",
+  "neutrality_pct", "happiness_pct"
+)
+
+for (var in vars) {
+  p <- ggplot(information_df, aes(x = .data[[var]])) +
+    geom_histogram(fill = "steel blue") +
+    xlab(var) +
+    ylab("Count") +
+    ggtitle(paste("Histogram of", var)) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(label = comma)
+  
+  print(p)
+}
+
+```
+
+
+### Random Effect Models
+
+```{r lmer_elm}
+
+phasic_elm <- lmer(
+  phasic_ads ~ avg_intonation_score + avg_speaking_rate + avg_loudness + 
+    avg_male_confidence + avg_estimated_age + neutrality_pct + happiness_pct + (1 | session_id),
+  data = information_df
+)
+summary(phasic_elm)
+
+ars_elm <- lmer(
+  ars_ads ~ avg_intonation_score + avg_speaking_rate + avg_loudness + 
+    avg_male_confidence + avg_estimated_age + neutrality_pct + happiness_pct + (1 | session_id),
+  data = information_df
+)
+summary(ars_elm)
+
+```
+
+
+```{r control_models}
+
+# Fit the control models using the LMER and extract residuals
+random_df <- modeling_full_df %>% 
+  select(
+    session_id, session_in, session_out, phasic_ads, ars_ads, segment_number,
+    ad_position, program_format, age_average, females_pct
+  ) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted"))
+
+control_phasic <- lmer(
+  phasic_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+
+control_ars <- lmer(
+  ars_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+
+# Add the residuals back into the dataset
+random_df <- random_df %>% 
+  mutate(
+    "phasic_resid" = residuals(control_phasic),
+    "ars_resid" = residuals(control_ars)
+  ) %>% 
+  select("session_id", "session_in", "session_out", "phasic_resid", "ars_resid")
+
+summary(control_phasic)
+summary(control_ars)
+
+```
+
+
+```{r lm_elm}
+
+# Combine the residual data into the modeling dataset
+resid_df <- information_df %>% 
+  left_join(random_df, by = c("session_id", "session_in", "session_out"))
+
+phasic_resid_model <- lm(
+  phasic_resid ~ avg_intonation_score + avg_speaking_rate + avg_loudness + 
+    avg_male_confidence + avg_estimated_age + neutrality_pct + happiness_pct,
+  data = resid_df
+)
+summary(phasic_resid_model)
+
+ars_resid_model <- lm(
+  ars_resid ~ avg_intonation_score + avg_speaking_rate + avg_loudness + 
+    avg_male_confidence + avg_estimated_age + neutrality_pct + happiness_pct,
+  data = resid_df
+)
+summary(ars_resid_model)
+
+```
+
+
+### Generalized Additive Model
+
+```{r gam_elm}
+
+phasic_gam <- gam(
+  phasic_ads ~ s(avg_intonation_score) + s(avg_speaking_rate) + s(avg_loudness) + 
+    s(avg_male_confidence) + s(avg_estimated_age) + s(neutrality_pct) + s(happiness_pct) +
+    s(session_id, bs = "re"),
+  data = information_df
+)
+summary(phasic_gam)
+plot(phasic_gam, pages = 1)
+
+ars_gam <- gam(
+  ars_ads ~ s(avg_intonation_score) + s(avg_speaking_rate) + s(avg_loudness) + 
+    s(avg_male_confidence) + s(avg_estimated_age) + s(neutrality_pct) + s(happiness_pct) +
+    s(session_id, bs = "re"),
+  data = information_df
+)
+summary(ars_gam)
+plot(ars_gam, pages = 1)
+
+```
+
+
+```{r gam_resid}
+
+phasic_resid_gam <- gam(
+  phasic_resid ~ s(avg_intonation_score) + s(avg_speaking_rate) + s(avg_loudness) + 
+    s(avg_male_confidence) + s(avg_estimated_age) + s(neutrality_pct) + s(happiness_pct) +
+    s(session_id, bs = "re"),
+  data = resid_df
+)
+summary(phasic_resid_gam)
+plot(phasic_resid_gam, pages = 1)
+
+ars_resid_gam <- gam(
+  ars_resid ~ s(avg_intonation_score) + s(avg_speaking_rate) + s(avg_loudness) + 
+    s(avg_male_confidence) + s(avg_estimated_age) + s(neutrality_pct) + s(happiness_pct) +
+    s(session_id, bs = "re"),
+  data = resid_df
+)
+summary(ars_resid_gam)
+plot(ars_resid_gam, pages = 1)
+
+```
+
+
+### Gradient Boosting Models - Full Models
+
+```{r full_model_prep}
+
+# Split the dataset into both phasic and ars
+phasic_full_df <- information_df %>% select(-c("session_id", "session_in", "session_out", "ars_ads"))
+ars_full_df <- information_df %>% select(-c("session_id", "session_in", "session_out", "phasic_ads"))
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_ads ~ ., data = phasic_full_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+ars_recipe <- recipe(ars_ads ~ ., data = ars_full_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% add_recipe(phasic_recipe) %>%  add_model(xgb_spec)
+ars_workflow <- workflow() %>% add_recipe(ars_recipe) %>% add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+phasic_cv <- vfold_cv(phasic_full_df, v = 10, strata = phasic_ads)
+ars_cv <- vfold_cv(ars_full_df, v = 10, strata = ars_ads)
+
+```
+
+
+```{r full_model_tuning}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_full_elm.rds")
+)
+
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_full_elm.rds")
+)
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = phasic_full_df)
+xgb_ars <- fit(ars_selected, data = ars_full_df)
+
+```
+
+
+```{r variables_importance}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Phasic Ads Variables Importance",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads Variables Importance",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r pdp_plots}
+
+# Extract the fitted model from workflows
+phasic_fit <- extract_fit_parsnip(xgb_phasic)
+ars_fit <- extract_fit_parsnip(xgb_ars)
+
+# Prep training data through the recipe
+phasic_baked <- phasic_recipe %>% prep() %>% bake(new_data = phasic_full_df)
+ars_baked <- ars_recipe %>% prep() %>% bake(new_data = ars_full_df)
+
+# Phasic PDP and ARS PDP
+features <- c(
+  "avg_intonation_score", "avg_speaking_rate", 
+  "avg_loudness", "avg_male_confidence", "avg_estimated_age",
+  "neutrality_pct", "happiness_pct"
+)
+generate_pdp_plots(phasic_fit, phasic_baked, "phasic_ads", features, "steelblue")
+generate_pdp_plots(ars_fit, ars_baked, "ars_ads", features, "darkorange")
+
+```
+
+
+```{r interaction_tables}
+
+# Extract the xgboost engine from the workflow
+xgb_phasic_engine <- extract_fit_engine(xgb_phasic)
+xgb_ars_engine <- extract_fit_engine(xgb_ars)
+
+# Prep the recipe to get the transformed data matrix
+phasic_prepped <- prep(phasic_recipe) %>% bake(new_data = NULL) %>% select(-phasic_ads) %>% as.matrix()
+ars_prepped <- prep(ars_recipe) %>% bake(new_data = NULL) %>% select(-ars_ads) %>% as.matrix()
+
+# Create SHAP objects
+shap_phasic <- shapviz(xgb_phasic_engine, X_pred = phasic_prepped)
+shap_ars <- shapviz(xgb_ars_engine, X_pred = ars_prepped)
+
+# Get interaction tables for both phasic and ars
+shap_phasic_int <- shapviz(xgb_phasic_engine, X_pred = phasic_prepped, interactions = TRUE)
+get_interaction_table(shap_phasic_int, phasic_prepped)
+
+shap_ars_int <- shapviz(xgb_ars_engine, X_pred = ars_prepped, interactions = TRUE)
+get_interaction_table(shap_ars_int, ars_prepped)
+
+```
+
+
+```{r interaction_plots}
+
+# Dependence plot for phasic model
+plot_shap_dependence(shap_phasic, "avg_loudness", "avg_male_confidence")
+plot_shap_dependence(shap_phasic, "avg_speaking_rate", "avg_male_confidence")
+plot_shap_dependence(shap_phasic, "avg_estimated_age", "avg_male_confidence")
+plot_shap_dependence(shap_phasic, "neutrality_pct", "avg_male_confidence")
+plot_shap_dependence(shap_phasic, "neutrality_pct", "avg_loudness")
+
+# Dependence plot for ars model
+plot_shap_dependence(shap_ars, "avg_intonation_score", "avg_male_confidence")
+plot_shap_dependence(shap_ars, "avg_intonation_score", "avg_speaking_rate")
+plot_shap_dependence(shap_ars, "avg_intonation_score", "neutrality_pct")
+plot_shap_dependence(shap_ars, "avg_loudness", "avg_male_confidence")
+plot_shap_dependence(shap_ars, "avg_speaking_rate", "neutrality_pct")
+
+```
+
+
+```{r pdp_interactions}
+
+# Examine the interactions between Speaking Rate and Gender - Phasic
+pd_interaction_phasic <- partial(
+  phasic_fit$fit,
+  pred.var = c("avg_speaking_rate", "avg_male_confidence"),
+  train = as.data.frame(phasic_baked %>% select(-phasic_ads)),
+  grid.resolution = 50
+)
+
+plotPartial(
+  pd_interaction,
+  levelplot = TRUE,
+  main = "Speaking Rate × Male Gender Confidence",
+  xlab = "Avg Speaking Rate",
+  ylab = "Male Confidence"
+)
+
+# Gender and intonation
+# Decide cutoff point for both male and female
+
+```
+

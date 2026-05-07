@@ -55,7 +55,11 @@ WINSORIZED_DATA AS (
             ELSE time_in
         END AS time_in,
         time_out,
-        phasic_ads,
+        CASE
+            WHEN phasic_ads > phasic_ads_upper THEN phasic_ads_upper
+            WHEN phasic_ads < phasic_ads_lower THEN phasic_ads_lower
+            ELSE phasic_ads
+        END AS phasic_ads,
         CASE
             WHEN ars_ads > ars_ads_upper THEN ars_ads_upper
             WHEN ars_ads < ars_ads_lower THEN ars_ads_lower

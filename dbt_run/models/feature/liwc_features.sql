@@ -33,7 +33,7 @@ FEATURE_DATA AS (
             start_time, "Study Name", Gender, Age, "Group", "Type", "Label", "Start (ms)", "Duration (ms)", "Parent Stimulus", "Comment",
             "Voice Activity (ms)", "Voice Activity (%)", "Maximum Emotion", "Average Fundamental Frequency Minimum", "Average Fundamental Frequency Maximum",
             "Average Fundamental Frequency Standard Deviation", "Average Loudness Minimum", "Average Loudness Maximum", "Average Loudness Standard Deviation",
-            "Average Male Confidence", "Average Female Confidence", "Average Child Confidence", "Average Estimated Age", "Segment_EN"
+            "Segment_EN"
         )
 
     FROM CAST_NA
@@ -55,7 +55,9 @@ RANAMED_COLUMNS AS (
             Comma AS comma, "Anger (%)" AS anger_pct, "Happiness (%)" AS happiness_pct, "Neutrality (%)" AS neutrality_pct,
             "Sadness (%)" AS sadness_pct, "Average Activation" AS avg_activation, "Average Dominance" AS avg_dominance, "Average Valence" AS avg_valence,
             "Average Fundamental Frequency Average" AS avg_fundamental_freq, "Average Loudness Average" AS avg_loudness, "Average Speaking Rate" AS avg_speaking_rate,
-            "Average Speaking Rate Variation" AS avg_speaking_rate_variation, "Average Intonation Score" AS avg_intonation_score
+            "Average Speaking Rate Variation" AS avg_speaking_rate_variation, "Average Intonation Score" AS avg_intonation_score,
+            "Average Male Confidence" AS avg_male_confidence, "Average Female Confidence" AS avg_female_confidence,
+            "Average Child Confidence" AS avg_child_confidence, "Average Estimated Age" AS avg_estimated_age
         )
 
     FROM EXCLUDED_PT

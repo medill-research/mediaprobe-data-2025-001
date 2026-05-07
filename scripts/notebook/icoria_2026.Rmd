@@ -1,0 +1,1676 @@
+
+### Setup and Inputs
+
+```{r setup}
+
+rm(list = ls())
+gc()
+
+library("officer")
+library("psych")
+library("broom.mixed")
+library("flextable")
+library("gtsummary")
+library("flextable")
+library("tidyr")
+library("lmerTest")
+library("moments")
+library("here")
+library("ggplot2")
+library("scales")
+library("dplyr")
+library("data.table")
+library("tidymodels")
+library("rsample")
+library("finetune")
+library("forcats")
+library("vip")
+library("xgboost")
+library("pdp")
+library("patchwork")
+library("shapviz")
+library("mice")
+library("mgcv")
+library("reshape2")
+
+options(scipen=999)
+options(width = 200)
+options(DT.options = list(warn = FALSE))
+
+```
+
+
+```{r inputs}
+
+# Get folder location of the data
+folder_location <- here("data", "export")
+model_folder <- here("data", "models")
+results_folder <- here("data", "results")
+
+# Read in the primary data used for Galvanic II modeling
+source_df <- fread(here(folder_location, "ads_us.csv"))
+full_df <- fread(here(folder_location, "ads_us_full.csv"))
+emotion_df <- fread(here(folder_location, "ads_us_emotions.csv"))
+
+# Preliminary preparation and defining columns for feature engineering
+FIXED_COLUMNS <- c(
+  "session_id", "session_in", "session_out", "phasic_ads", "ars_ads",
+  "ads_comparison", "segment_number", "ad_position", "program_country",
+  "age_average", "females_pct"
+)
+IDENT_COLUMNS <- c("session_id", "session_in", "session_out")
+
+modeling_df <- source_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+modeling_full_df <- full_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+emotion_full_df <- emotion_df %>% 
+  mutate(females_pct = females_pct / 100)
+
+```
+
+
+```{r gender_check}
+
+ggplot(modeling_full_df, aes(x = avg_male_confidence, y = avg_female_confidence)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  labs(
+    title = "Average Male % vs Average Female %",
+    x = "Average Male %",
+    y = "Average Female %"
+  ) +
+  scale_y_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 7),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.margin = margin(5, 10, 5, 10)
+  )
+
+```
+
+
+```{r distribution_check}
+
+# Examine the histogram for each of the variable
+vars <- c(
+  "ars_ads", "phasic_ads", "avg_intonation_score", "avg_speaking_rate", 
+  "avg_loudness", "avg_male_confidence", "avg_estimated_age",
+  "neutrality_pct", "happiness_pct",
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+  "Perception_EN", "Conversation_EN"
+)
+
+for (var in vars) {
+  p <- ggplot(modeling_full_df, aes(x = .data[[var]])) +
+    geom_histogram(fill = "steel blue") +
+    xlab(var) +
+    ylab("Count") +
+    ggtitle(paste("Histogram of", var)) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(label = comma)
+  
+  print(p)
+}
+
+summary(modeling_full_df %>% select(vars))
+
+```
+
+
+```{r data_modification}
+
+# Create a dataset with subset of variables
+ars_df <- modeling_full_df %>% 
+  select(
+    "session_id", "session_in", "session_out", "ars_ads",
+    "avg_intonation_score", "avg_speaking_rate", "avg_loudness",
+    "avg_male_confidence", "avg_estimated_age", "neutrality_pct", "happiness_pct",
+    "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+    "Affect_EN", "Social_EN", "Culture_EN", "Lifestyle_EN", "Physical_EN",
+    "Perception_EN", "Conversation_EN"
+  ) %>% 
+  mutate(across(c("neutrality_pct", "happiness_pct"), ~ .x / 100))
+
+# Impute the missing values from average intonation and average speaking rate using MICE
+winsorize_vars <- c("avg_speaking_rate", "avg_loudness", "avg_intonation_score", "avg_estimated_age")
+imputed <- mice(ars_df, m = 1, method = "pmm", seed = 3825)
+ars_df <- complete(imputed) %>% 
+  mutate(
+    across(
+      all_of(winsorize_vars),
+      ~ case_when(
+        .x > quantile(.x, 0.995, na.rm = TRUE) ~ quantile(.x, 0.995, na.rm = TRUE),
+        .x < quantile(.x, 0.005, na.rm = TRUE) ~ quantile(.x, 0.005, na.rm = TRUE),
+        TRUE ~ .x
+      )
+    )
+  )
+
+# Perform data transformation before modeling
+winsorize_vars <- c(
+  "Physical_EN", "Lifestyle_EN", "Drives_EN", "Cognition_EN", "Affect_EN",
+  "Social_EN", "Culture_EN"
+)
+ars_df <- ars_df %>%
+  mutate(
+    across(
+      all_of(winsorize_vars),
+      ~ case_when(
+        .x > quantile(.x, 0.995, na.rm = TRUE) ~ quantile(.x, 0.995, na.rm = TRUE),
+        .x < quantile(.x, 0.005, na.rm = TRUE) ~ quantile(.x, 0.005, na.rm = TRUE),
+        TRUE ~ .x
+      )
+    )
+  ) %>% 
+  select(-Conversation_EN, -Culture_EN)
+
+# Recheck the distribution for each variable
+vars <- c(
+  "ars_ads", "avg_intonation_score", "avg_speaking_rate", 
+  "avg_loudness", "avg_male_confidence", "avg_estimated_age",
+  "neutrality_pct", "happiness_pct",
+  "Authentic_EN", "Drives_EN", "Cognition_EN", "Clout_EN",
+  "Affect_EN", "Social_EN", "Lifestyle_EN", "Physical_EN",
+  "Perception_EN"
+)
+
+for (var in vars) {
+  p <- ggplot(ars_df, aes(x = .data[[var]])) +
+    geom_histogram(fill = "steel blue") +
+    xlab(var) +
+    ylab("Count") +
+    ggtitle(paste("Histogram of", var)) +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    scale_y_continuous(label = comma)
+  
+  print(p)
+}
+
+# Create a dataset with the modified data for phasic modeling
+phasic_df <- ars_df %>% 
+  left_join(
+    modeling_full_df %>% select("session_id", "session_in", "session_out", "phasic_ads"),
+    by = c("session_id", "session_in", "session_out")
+  ) %>% 
+  select(-ars_ads) %>% 
+  relocate(phasic_ads, .before = "avg_intonation_score")
+
+```
+
+
+### Helper Functions
+
+```{r bayes_tuning_function}
+
+# Create a helper function to save tuned XGBoost models
+xgb_tuning <- function(workflow, resamples, param_info, cache_path, seed = 3825) {
+  
+  # Create the directory if needed
+  cache_dir <- dirname(cache_path)
+  if (!dir.exists(cache_dir)) {
+    dir.create(cache_dir, recursive = TRUE)
+    message("Created folder: ", cache_dir)
+  }
+  
+  # Check cache
+  if (file.exists(cache_path)) {
+    message("Loading cached model from: ", cache_path)
+    return(readRDS(cache_path))
+  }
+  
+  # Run tuning
+  message("Running Bayesian tuning...")
+  set.seed(seed)
+  tuned_result <- tune_bayes(
+    workflow,
+    resamples = resamples,
+    initial = 15,
+    iter = 30,
+    param_info = param_info,
+    metrics = metric_set(rmse, rsq),
+    control = control_bayes(verbose = TRUE, no_improve = 10)
+  )
+  
+  # Save and return
+  saveRDS(tuned_result, cache_path)
+  message("Saved tuned model to: ", cache_path)
+  return(tuned_result)
+  
+}
+
+```
+
+
+```{r pdp_function}
+
+generate_pdp_plots <- function(
+    fit, baked_data,
+    target_col,
+    features,
+    color = "#4A148C",
+    title = "Marginal Effect Plots",
+    subtitle = "Effect of Each Feature on Residualized Interest Intensity"
+) {
+  pdp_plots <- lapply(features, function(feat) {
+    pdp::partial(
+      fit$fit,
+      pred.var = feat,
+      train = as.data.frame(baked_data %>% select(-all_of(target_col))),
+      type = "regression",
+      plot = FALSE
+    )
+  })
+  
+  plot_list <- lapply(seq_along(features), function(i) {
+    ggplot() +
+      geom_line(
+        data = pdp_plots[[i]], 
+        aes(x = .data[[features[i]]], y = yhat), 
+        color = color, linewidth = 1
+      ) +
+      geom_rug(
+        data = baked_data, 
+        aes(x = .data[[features[i]]]),
+        alpha = 0.1, sides = "b"
+      ) +
+      labs(title = features[i], x = NULL, y = "Marginal Effect") +
+      scale_y_continuous(labels = scales::label_number(accuracy = 0.0001)) +
+      theme_minimal() +
+      theme(
+        axis.text = element_text(size = 7),
+        axis.title.y = element_text(size = 8),
+        plot.title = element_text(size = 9, face = "bold", hjust = 0.5),
+        plot.margin = margin(5, 10, 5, 10),
+        panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+        panel.grid.minor = element_blank()
+      )
+  })
+  
+  wrap_plots(plot_list, ncol = 3) +
+    plot_annotation(
+      title = title,
+      subtitle = subtitle,
+      theme = theme(
+        plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+        plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10))
+      )
+    )
+}
+
+```
+
+
+```{r interaction_matrix}
+
+get_interaction_table <- function(shap_int, prepped_data, top_n = 15) {
+  int_matrix <- shap_int$S_inter
+  n_features <- ncol(prepped_data)
+  feature_names <- colnames(prepped_data)
+  interaction_strength <- matrix(0, n_features, n_features)
+  
+  for (i in 1:n_features) {
+    for (j in 1:n_features) {
+      interaction_strength[i, j] <- mean(abs(int_matrix[, i, j]))
+    }
+  }
+  
+  rownames(interaction_strength) <- feature_names
+  colnames(interaction_strength) <- feature_names
+  
+  int_df <- melt(interaction_strength) %>%
+    mutate(Var1 = as.character(Var1), Var2 = as.character(Var2)) %>%
+    filter(Var1 < Var2) %>%
+    arrange(desc(value)) %>%
+    head(top_n)
+  
+  return(int_df)
+}
+
+```
+
+
+```{r dependence_plot}
+
+plot_shap_dependence <- function(
+    shap_obj, var,
+    color_var, 
+    title = NULL,
+    x_label = NULL,
+    color_label = NULL,
+    palette = "plasma"
+) {
+  
+  if (is.null(title)) title <- paste0("SHAP: ", var, " × ", color_var)
+  if (is.null(x_label)) x_label <- var
+  if (is.null(color_label)) color_label <- color_var
+  
+  sv_dependence(shap_obj, v = var, color_var = color_var) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      legend.position = "right"
+    ) +
+    labs(
+      title = title,
+      x = x_label,
+      y = "SHAP Value",
+      color = color_label
+    ) +
+    scale_color_viridis_c(option = palette)
+}
+
+```
+
+
+```{r pdp_interactions}
+
+plot_pdp_interaction <- function(
+    fit, baked_data, target_col,
+    var1, var2,
+    title = NULL,
+    subtitle = NULL,
+    x_label = NULL,
+    y_label = NULL,
+    resolution = 50
+) {
+  
+  if (is.null(title)) title <- paste0(var1, " × ", var2)
+  if (is.null(subtitle)) subtitle <- "Partial Dependence Interaction"
+  if (is.null(x_label)) x_label <- var1
+  if (is.null(y_label)) y_label <- var2
+  
+  pd <- pdp::partial(
+    fit$fit,
+    pred.var = c(var1, var2),
+    train = as.data.frame(baked_data %>% select(-all_of(target_col))),
+    grid.resolution = resolution
+  )
+  
+  ggplot(pd, aes(x = .data[[var1]], y = .data[[var2]], fill = yhat)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#FF8A65",
+      mid = "#F7F7F7",
+      high = "#4A148C",
+      midpoint = median(pd$yhat),
+      name = "Partial\nDependence"
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = x_label,
+      y = y_label
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+      plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+      panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+      panel.grid = element_blank()
+    )
+}
+
+```
+
+
+```{r faceted_plots}
+
+plot_interaction_lines <- function(
+    fit, baked_data, target_col, var1, var2,
+    title = NULL, subtitle = NULL, n_groups = 3
+) {
+  if (is.null(title)) title <- paste0(var1, " × ", var2)
+  if (is.null(subtitle)) subtitle <- "Cross-Modal Interaction Effect on Residualized EDA"
+  
+  breaks <- unique(quantile(baked_data[[var2]], 
+                            probs = seq(0, 1, length.out = n_groups + 1), 
+                            na.rm = TRUE))
+  
+  if (length(breaks) < n_groups + 1) {
+    baked_data <- baked_data %>%
+      mutate(group = cut(.data[[var2]], breaks = n_groups, labels = c("Low", "Medium", "High")))
+  } else {
+    baked_data <- baked_data %>%
+      mutate(
+        group = cut(
+          .data[[var2]],
+          breaks = breaks,
+          include.lowest = TRUE,
+          labels = c("Low", "Medium", "High")[1:(length(breaks) - 1)]
+        )
+      )
+  }
+  
+  plot_data <- map_dfr(levels(baked_data$group), function(g) {
+    subset_data <- baked_data %>% filter(group == g)
+    pd <- pdp::partial(
+      fit$fit,
+      pred.var = var1,
+      train = as.data.frame(subset_data %>% select(-all_of(target_col), -group)),
+      type = "regression",
+      plot = FALSE
+    )
+    pd$group <- g
+    pd
+  })
+  
+  ggplot(plot_data, aes(x = .data[[var1]], y = yhat, color = group)) +
+    geom_line(linewidth = 1.2) +
+    scale_color_manual(
+      values = c("Low" = "#FF8A65", "Medium" = "#B39DDB", "High" = "#4A148C"),
+      name = var2
+    ) +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = var1,
+      y = "Marginal Effect on Arousal"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+      plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+      panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+      panel.grid.minor = element_blank()
+    )
+}
+
+```
+
+
+### Residual Modeling - Intercept + XGBoost
+
+```{r control_models}
+
+# Fit the control models using the LMER and extract residuals
+random_df <- modeling_full_df %>% 
+  select(
+    session_id, session_in, session_out, phasic_ads, ars_ads, segment_number,
+    ad_position, program_format, age_average, females_pct
+  ) %>% 
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted"))
+
+control_ars <- lmer(
+  ars_ads ~ segment_number + ad_position + program_format + 
+    age_average + females_pct + (1 | session_id),
+  data = random_df
+)
+
+# Add the residuals back into the dataset
+random_df <- random_df %>% 
+  mutate("ars_resid" = residuals(control_ars)) %>% 
+  select("session_id", "session_in", "session_out", "ars_resid")
+
+ars_modeling <- ars_df %>% 
+  left_join(random_df, by = c("session_id", "session_in", "session_out")) %>% 
+  select(-c("session_id", "session_in", "session_out"))
+
+summary(control_ars)
+
+# Fixed effects table
+tbl <- tbl_regression(control_ars, estimate_fun = ~ style_sigfig(., digits = 6))
+
+# Extract random effects info
+re <- as.data.frame(VarCorr(control_ars))
+random_effects_note <- paste0(
+  "Random Effects: Session intercept variance = ", 
+  round(re$vcov[1], 6),
+  ", Residual variance = ", 
+  round(re$vcov[2], 6)
+)
+
+# Add as footnote
+tbl <- tbl %>%
+  modify_footnote(everything() ~ random_effects_note)
+
+# Save the modeling results into a Word Doc
+tbl %>%
+  as_flex_table() %>%
+  save_as_docx(path = here(results_folder, "lmer_results.docx"))
+
+```
+
+
+```{r model_prep}
+
+# Create recipe for trainer
+ars_resid_recipe <- recipe(ars_resid ~ ., data = ars_modeling %>% select(-ars_ads)) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec_resid <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params_resid <- xgb_spec_resid %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+ars_workflow_resid <- workflow() %>% add_recipe(ars_resid_recipe) %>% add_model(xgb_spec_resid)
+
+# Create cross-validation fold for both trainers
+set.seed(6297)
+ars_cv_resid <- vfold_cv(ars_modeling, v = 10, strata = ars_resid)
+
+```
+
+
+```{r full_model_tuning}
+
+# Tune models and save as cache
+ars_tuned_resid <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_icoria_residuals.rds")
+)
+
+# Select best parameters and create workflow
+ars_params_resid <- select_best(ars_tuned_resid, metric = "rmse")
+ars_selected_resid <- finalize_workflow(ars_workflow_resid, ars_params_resid)
+
+# Fit the final models
+xgb_ars_resid <- fit(ars_selected_resid, data = ars_modeling %>% select(-ars_ads))
+
+```
+
+
+```{r variables_importance}
+
+# Extract variable importance out into a table
+ars_importance_resid <- xgb_ars_resid %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+ars_importance_resid %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads Variables Importance",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r partial_dependence}
+
+# Extract the fitted model from workflows
+ars_fit_resid <- extract_fit_parsnip(xgb_ars_resid)
+
+# Prep training data through the recipe
+ars_baked_resid <- ars_resid_recipe %>% prep() %>% bake(new_data = ars_modeling %>% select(-ars_ads))
+
+# Phasic PDP and ARS PDP
+features_voice <- c(
+  "avg_speaking_rate", "neutrality_pct", "avg_intonation_score",
+  "avg_loudness", "happiness_pct", "avg_estimated_age", "avg_male_confidence"
+)
+features_liwc <- c(
+  "Perception_EN", "Physical_EN", "Affect_EN", "Social_EN",
+  "Lifestyle_EN", "Authentic_EN", "Drives_EN", "Clout_EN", "Cognition_EN"
+)
+generate_pdp_plots(ars_fit_resid, ars_baked_resid, "ars_resid", features_voice, "steelblue")
+generate_pdp_plots(ars_fit_resid, ars_baked_resid, "ars_resid", features_liwc, "steelblue")
+
+```
+
+
+```{r shap_summary}
+
+# Extract the xgboost engine
+xgb_engine_resid <- xgb_ars_resid %>% extract_fit_engine()
+
+# Prep and bake using the exact same data the recipe was built on
+ars_prepped_resid <- prep(ars_resid_recipe, training = ars_modeling %>% select(-ars_ads))
+X <- bake(ars_prepped_resid, new_data = ars_modeling %>% select(-ars_ads)) %>%
+  select(-ars_resid) %>%
+  as.matrix()
+
+# Create shapviz object
+shap_obj_resid <- shapviz(xgb_engine_resid, X_pred = X)
+
+# Summary beeswarm plot
+sv_importance(shap_obj_resid, kind = "beeswarm") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.title = element_text(size = 12)
+  ) +
+  labs(
+    title = "SHAP Summary Plot - ARS Residual Model",
+    x = "SHAP Value (Impact on Arousal)",
+    y = NULL
+  )
+
+```
+
+
+```{r interaction_analysis}
+
+# Extract interaction table
+xgb_ars_engine <- extract_fit_engine(xgb_ars_resid)
+ars_prepped <- prep(ars_resid_recipe) %>% bake(new_data = NULL) %>% select(-ars_resid) %>% as.matrix()
+shap_ars <- shapviz(xgb_ars_engine, X_pred = ars_prepped)
+shap_interact <- shapviz(xgb_ars_engine, X_pred = ars_prepped, interaction = TRUE)
+
+# Create the pairwise interaction table
+int_table <- get_interaction_table(shap_interact, ars_prepped, top_n = 30)
+
+# Create cross-model interaction table
+voice_vars <- c(
+  "avg_speaking_rate", "avg_intonation_score", "avg_loudness",
+  "avg_male_confidence", "avg_estimated_age", "neutrality_pct", 
+  "happiness_pct"
+)
+liwc_vars <- c(
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Lifestyle_EN", "Physical_EN", 
+  "Perception_EN"
+)
+
+cross_modal <- int_table %>%
+  filter(
+    (Var1 %in% voice_vars & Var2 %in% liwc_vars) |
+    (Var1 %in% liwc_vars & Var2 %in% voice_vars)
+  )
+print(cross_modal)
+
+```
+
+
+```{r happiness_interactions}
+
+# Plot dependence plot - Happiness
+plot_shap_dependence(shap_ars, "Authentic_EN", "happiness_pct")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Authentic_EN", "happiness_pct",
+  title = "Residual Model: Authenticity × Happiness",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Authentic_EN",
+  color_var = "happiness_pct",interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Athenticity × Happiness",
+    x = "Authentic_EN",
+    y = "SHAP Interaction Value"
+  )
+
+plot_shap_dependence(shap_ars, "Affect_EN", "happiness_pct")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Affect_EN", "happiness_pct",
+  title = "Residual Model: Affect × Happiness",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Affect_EN", 
+  color_var = "happiness_pct", interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Affect × Happiness",
+    x = "Affect_EN",
+    y = "SHAP Interaction Value"
+  )
+
+
+
+
+
+plot_shap_dependence(shap_ars, "neutrality_pct", "Physical_EN")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "neutrality_pct", "Physical_EN",
+  title = "Residual Model: Neu × Phy",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Affect_EN", 
+  color_var = "happiness_pct", interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Affect × Happiness",
+    x = "Affect_EN",
+    y = "SHAP Interaction Value"
+  )
+
+```
+
+
+```{r intonation_interactions}
+
+# Plot dependence plot - Intonation
+plot_shap_dependence(shap_ars, "Authentic_EN", "avg_intonation_score")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Authentic_EN", "avg_intonation_score",
+  title = "Residual Model: Authenticity × Intonation",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Authentic_EN",
+  color_var = "avg_intonation_score",interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Athenticity × Intonation",
+    x = "Authentic_EN",
+    y = "SHAP Interaction Value"
+  )
+
+plot_shap_dependence(shap_ars, "Affect_EN", "avg_intonation_score")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Affect_EN", "avg_intonation_score",
+  title = "Residual Model: Affect × Intonation",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Affect_EN", 
+  color_var = "avg_intonation_score", interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Affect × Intonation",
+    x = "Affect_EN",
+    y = "SHAP Interaction Value"
+  )
+
+plot_shap_dependence(shap_ars, "Perception_EN", "avg_intonation_score")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Perception_EN", "avg_intonation_score",
+  title = "Residual Model: Perception × Intonation",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Perception_EN", 
+  color_var = "avg_intonation_score", interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Perception × Intonation",
+    x = "Perception_EN",
+    y = "SHAP Interaction Value"
+  )
+
+plot_shap_dependence(shap_ars, "Cognition_EN", "avg_intonation_score")
+plot_pdp_interaction(
+  ars_fit_resid, ars_baked_resid, "ars_resid",
+  "Cognition_EN", "avg_intonation_score",
+  title = "Residual Model: Cognition × Intonation",
+  resolution = 50
+)
+sv_dependence(
+  shap_interact, v = "Cognition_EN", 
+  color_var = "avg_intonation_score", interactions = TRUE
+) +
+  theme_bw() +
+  labs(
+    title = "SHAP Interaction Effect: Perception × Intonation",
+    x = "Cognition_EN",
+    y = "SHAP Interaction Value"
+  )
+
+```
+
+
+### ARS Modeling - XGBoost
+
+```{r model_prep}
+
+# Create recipe for trainer
+ars_source_recipe <- recipe(ars_ads ~ ., data = ars_modeling %>% select(-ars_resid)) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec_source <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params_source <- xgb_spec_source %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+ars_workflow_source <- workflow() %>% add_recipe(ars_source_recipe) %>% add_model(xgb_spec_source)
+
+# Create cross-validation fold for both trainers
+set.seed(6297)
+ars_cv_source <- vfold_cv(ars_modeling, v = 10, strata = ars_ads)
+
+```
+
+
+```{r model_tuning}
+
+# Tune models and save as cache
+ars_tuned_source <- xgb_tuning(
+  ars_workflow_source,
+  ars_cv_source,
+  xgb_params_source,
+  here(model_folder, "ars_icoria_source.rds")
+)
+
+# Select best parameters and create workflow
+ars_params_source <- select_best(ars_tuned_source, metric = "rmse")
+ars_selected_source <- finalize_workflow(ars_workflow_source, ars_params_source)
+
+# Fit the final models
+xgb_ars_source <- fit(ars_selected_source, data = ars_modeling %>% select(-ars_resid))
+
+```
+
+
+```{r variable_importance}
+
+# Extract variable importance out into a table
+ars_importance_source <- xgb_ars_source %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+ars_importance_source %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Ars Ads Variables Importance",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal()
+
+```
+
+
+```{r partial_dependence}
+
+# Extract the fitted model from workflows
+ars_fit_source <- extract_fit_parsnip(xgb_ars_source)
+
+# Prep training data through the recipe
+ars_baked_source <- ars_source_recipe %>% prep() %>% bake(new_data = ars_modeling %>% select(-ars_resid))
+
+# Phasic PDP and ARS PDP
+features_voice <- c(
+  "avg_speaking_rate", "neutrality_pct", "avg_intonation_score",
+  "avg_loudness", "happiness_pct", "avg_estimated_age", "avg_male_confidence"
+)
+features_liwc <- c(
+  "Perception_EN", "Physical_EN", "Affect_EN", "Social_EN",
+  "Lifestyle_EN", "Authentic_EN", "Drives_EN", "Clout_EN", "Cognition_EN"
+)
+generate_pdp_plots(ars_fit_source, ars_baked_source, "ars_ads", features_voice, "steelblue")
+generate_pdp_plots(ars_fit_source, ars_baked_source, "ars_ads", features_liwc, "steelblue")
+
+```
+
+
+### Analysis Views & Comparisons
+
+```{r pdp_compare}
+
+# Compre the partial dependence plots for residual model and model using source ARS
+generate_pdp_plots(
+  ars_fit_resid, ars_baked_resid, "ars_resid", features_voice, "steelblue",
+  "PDP Residuals - Voice Analysis"
+)
+generate_pdp_plots(
+  ars_fit_source, ars_baked_source, "ars_ads", features_voice, "steelblue",
+  "PDP Source - Voice Analysis"
+)
+
+generate_pdp_plots(
+  ars_fit_resid, ars_baked_resid, "ars_resid", features_liwc, "steelblue",
+  "PDP Residuals - LIWC"
+)
+generate_pdp_plots(
+  ars_fit_source, ars_baked_source, "ars_ads", features_liwc, "steelblue",
+  "PDP Source - LIWC"
+)
+
+```
+
+
+```{r lmer_tests}
+
+# Test out LMER model using all variables from voice analysis and LIWC
+ars_lmer <- lmer(
+  ars_ads ~ avg_intonation_score + avg_speaking_rate + avg_loudness + avg_male_confidence +
+    avg_estimated_age + neutrality_pct + happiness_pct + Clout_EN + Authentic_EN + Drives_EN + 
+    Cognition_EN + Affect_EN + Social_EN + Lifestyle_EN + Physical_EN + Perception_EN + 
+    (1 | session_id),
+  data = ars_df %>% select(-session_in, -session_out)
+)
+summary(ars_lmer)
+
+```
+
+
+### ICORIA Finalize
+
+```{r data_preparation}
+
+# Prepare model for modeling - log transforming all features
+log_variables = c(
+  "neutrality_pct", "happiness_pct", "Authentic_EN", "Drives_EN", "Affect_EN",
+  "Social_EN", "Lifestyle_EN", "Physical_EN", "Perception_EN"
+)
+icoria_df <- ars_modeling %>% 
+  select(-ars_ads) %>% 
+  mutate(across(all_of(log_variables), ~ log1p(.)))
+
+# Get correlation between linguistic features and voice features with ARS residuals
+cor_vars <- icoria_df %>% select(ars_resid, everything())
+var_order <- c("ars_resid", setdiff(colnames(cor_vars), "ars_resid"))
+
+cor_matrix <- cor(cor_vars, use = "complete.obs")
+cor_melted <- melt(cor_matrix)
+
+cor_melted$Var1 <- factor(cor_melted$Var1, levels = rev(var_order))
+cor_melted$Var2 <- factor(cor_melted$Var2, levels = var_order)
+
+ggplot(cor_melted, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(
+    low = "#FF8A65",
+    mid = "#F7F7F7",
+    high = "#4A148C",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5)
+  ) +
+  labs(
+    title = "Feature Correlation Matrix",
+    subtitle = "Linguistic, Vocal, and Physiological Features",
+    fill = "Correlation"
+  )
+
+```
+
+
+```{r model_prep}
+
+# Create recipe for trainer
+ars_recipe <- recipe(ars_resid ~ ., data = icoria_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+ars_workflow <- workflow() %>% add_recipe(ars_recipe) %>% add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+set.seed(6297)
+ars_cv <- vfold_cv(icoria_df, v = 10, strata = ars_resid)
+
+```
+
+
+```{r model_tuning}
+
+# Tune models and save as cache
+ars_tuned <- xgb_tuning(
+  ars_workflow,
+  ars_cv,
+  xgb_params,
+  here(model_folder, "ars_icoria.rds")
+)
+
+# Select best parameters and create workflow
+ars_params <- select_best(ars_tuned, metric = "rmse")
+ars_selected <- finalize_workflow(ars_workflow, ars_params)
+
+# Fit the final models
+xgb_ars <- fit(ars_selected, data = icoria_df)
+
+```
+
+
+```{r single_variable_plots}
+
+# Extract variable importance out into a table
+ars_importance <- xgb_ars %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+ars_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#4A148C", width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Variable Importance",
+    subtitle = "Gradient Boosting Model — Top 20 Features by Gain",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Extract the fitted model from workflows
+ars_fit <- extract_fit_parsnip(xgb_ars)
+
+# Prep training data through the recipe
+ars_baked <- ars_recipe %>% prep() %>% bake(new_data = icoria_df)
+
+# Phasic PDP and ARS PDP
+features_voice <- c(
+  "avg_speaking_rate", "neutrality_pct", "avg_intonation_score",
+  "avg_loudness", "happiness_pct", "avg_estimated_age", "avg_male_confidence"
+)
+features_liwc <- c(
+  "Perception_EN", "Physical_EN", "Affect_EN", "Social_EN",
+  "Lifestyle_EN", "Authentic_EN", "Drives_EN", "Clout_EN", "Cognition_EN"
+)
+generate_pdp_plots(
+  ars_fit,
+  ars_baked,
+  "ars_resid",
+  features_voice,
+  "#4A148C",
+  subtitle = "Gradient Boosting Model — Effect of Voice Features on Residualized Interest Intensity"
+)
+generate_pdp_plots(
+  ars_fit,
+  ars_baked, 
+  "ars_resid",
+  features_liwc,
+  "#4A148C",
+  subtitle = "Gradient Boosting Model — Effect of Linguistic Features on Residualized Interest Intensity"
+)
+
+```
+
+
+```{r interaction_summary}
+
+# Extract interaction table
+xgb_ars_engine <- extract_fit_engine(xgb_ars)
+ars_prepped <- prep(ars_recipe) %>% bake(new_data = NULL) %>% select(-ars_resid) %>% as.matrix()
+shap_ars <- shapviz(xgb_ars_engine, X_pred = ars_prepped)
+shap_interact <- shapviz(xgb_ars_engine, X_pred = ars_prepped, interaction = TRUE)
+
+# Create the pairwise interaction table
+int_table <- get_interaction_table(shap_interact, ars_prepped, top_n = 30)
+
+# Create cross-model interaction table
+voice_vars <- c(
+  "avg_speaking_rate", "avg_intonation_score", "avg_loudness",
+  "avg_male_confidence", "avg_estimated_age", "neutrality_pct", 
+  "happiness_pct"
+)
+liwc_vars <- c(
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Lifestyle_EN", "Physical_EN", 
+  "Perception_EN"
+)
+
+cross_modal <- int_table %>%
+  filter(
+    (Var1 %in% voice_vars & Var2 %in% liwc_vars) |
+    (Var1 %in% liwc_vars & Var2 %in% voice_vars)
+  )
+
+# Save the table into Word ready format
+cross_modal_table <- cross_modal %>%
+  head(20) %>%
+  mutate(
+    Rank = row_number(),
+    value = formatC(value, format = "f", digits = 6)
+  ) %>%
+  select(Rank, `Voice Feature` = Var1, `Linguistic Feature` = Var2, `Interaction Strength` = value)
+
+ft <- flextable(cross_modal_table) %>%
+  set_caption("Top 20 SHAP Interaction Effects") %>%
+  theme_booktabs() %>%
+  align(align = "center", part = "all") %>%
+  autofit()
+
+save_as_docx(ft, path = here(results_folder, "cross_modal_interactions.docx"))
+
+```
+
+
+```{r shap_dependence}
+
+# Neutrality Percentage and Physical
+plot_pdp_interaction(
+  ars_fit, ars_baked, "ars_resid",
+  "neutrality_pct", "Physical_EN",
+  title = "Neutrality Percentage × Physical",
+  subtitle = "Cross-Modal Interaction Effect on Residualized Interest Intensity",
+  resolution = 50
+)
+
+# Affect x Male Confidence
+plot_pdp_interaction(
+  ars_fit, ars_baked, "ars_resid",
+  "avg_male_confidence", "Affect_EN",
+  title = "Male Confidence Score × Affect",
+  subtitle = "Cross-Modal Interaction Effect on Residualized Interest Intensity",
+  resolution = 50
+)
+
+# Authenticity x Neutrality Percentage
+plot_pdp_interaction(
+  ars_fit, ars_baked, "ars_resid",
+  "neutrality_pct", "Authentic_EN",
+  title = "Neutrality Percentage × Authenticity",
+  subtitle = "Cross-Modal Interaction Effect on Residualized Interest Intensity",
+  resolution = 50
+)
+
+# Social x Average Speaking Rate
+plot_pdp_interaction(
+  ars_fit, ars_baked, "ars_resid",
+  "avg_speaking_rate", "Social_EN",
+  title = "Average Speaking Rate × Social",
+  subtitle = "Cross-Modal Interaction Effect on Residualized Interest Intensity",
+  resolution = 50
+)
+
+# Intonation x Affect
+plot_pdp_interaction(
+  ars_fit, ars_baked, "ars_resid",
+  "avg_intonation_score", "Affect_EN",
+  title = "Average Intonation Score × Affect",
+  subtitle = "Cross-Modal Interaction Effect on Residualized Interest Intensity",
+  resolution = 50
+)
+
+```
+
+
+### ICORIA - Phasic Research
+
+```{r control_model}
+
+# Fit a control model to get residuals for phasic
+phasic_random <- modeling_full_df %>%
+  select(
+    session_id, session_in, session_out, phasic_ads, segment_number,
+    ad_position, program_format, age_average, females_pct
+  ) %>%
+  mutate(program_format = fct_relevel(program_format, "Sports", "Scripted", "Unscripted"))
+
+control_phasic <- lmer(
+  phasic_ads ~ segment_number + ad_position + program_format +
+    age_average + females_pct + (1 | session_id),
+  data = phasic_random
+)
+summary(control_phasic)
+
+# Add the residuals back into the dataset
+phasic_random <- phasic_random %>%
+  mutate("phasic_resid" = residuals(control_phasic)) %>%
+  select("session_id", "session_in", "session_out", "phasic_resid")
+
+phasic_modeling <- phasic_df %>%
+  left_join(phasic_random, by = c("session_id", "session_in", "session_out")) %>%
+  select(-c("session_id", "session_in", "session_out"))
+
+# Fixed effects table
+re <- as.data.frame(VarCorr(control_phasic))
+random_effects_note <- paste0(
+  "Random Effects: Session intercept variance = ", 
+  round(re$vcov[1], 6),
+  ", Residual variance = ", 
+  round(re$vcov[2], 6)
+)
+
+tbl <- tbl_regression(
+  control_phasic,
+  tidy_fun = broom.mixed::tidy,
+  estimate_fun = ~ style_sigfig(., digits = 6),
+  add_estimate_to_reference_rows = FALSE
+) %>%
+  add_glance_source_note() %>%
+  modify_column_unhide(columns = statistic) %>%
+  modify_header(statistic ~ "**t-value**") %>%
+  modify_footnote(everything() ~ random_effects_note)
+
+tbl %>%
+  as_flex_table() %>%
+  save_as_docx(path = here(results_folder, "lmer_phasic.docx"))
+
+```
+
+
+```{r log_transformation}
+
+# Prepare model for modeling - log transforming all features
+log_variables = c(
+  "neutrality_pct", "happiness_pct", "Authentic_EN", "Drives_EN", "Affect_EN",
+  "Social_EN", "Lifestyle_EN", "Physical_EN", "Perception_EN"
+)
+icoria_df <- phasic_modeling %>% 
+  select(-phasic_ads) %>% 
+  mutate(across(all_of(log_variables), ~ log1p(.)))
+
+```
+
+
+```{r descriptive_stats}
+
+describe(phasic_modeling %>% select(-phasic_resid))
+
+```
+
+
+```{r correlation_plot}
+
+# Get correlation between linguistic features and voice features with ARS residuals
+cor_vars <- icoria_df %>% select(phasic_resid, everything())
+var_order <- c("phasic_resid", setdiff(colnames(cor_vars), "phasic_resid"))
+
+cor_matrix <- cor(cor_vars, use = "complete.obs")
+cor_melted <- melt(cor_matrix)
+
+cor_melted$Var1 <- factor(cor_melted$Var1, levels = rev(var_order))
+cor_melted$Var2 <- factor(cor_melted$Var2, levels = var_order)
+
+ggplot(cor_melted, aes(x = Var2, y = Var1, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(
+    low = "#FF8A65",
+    mid = "#F7F7F7",
+    high = "#4A148C",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5)
+  ) +
+  labs(
+    title = "Feature Correlation Matrix",
+    subtitle = "Linguistic, Vocal, and Physiological Features",
+    fill = "Correlation"
+  )
+
+```
+
+
+```{r model_prep}
+
+# Create recipe for trainer
+phasic_recipe <- recipe(phasic_resid ~ ., data = icoria_df) %>% 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+# Create model spec for both trainers
+xgb_spec <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  min_n = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  sample_size = tune()
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("regression")
+
+xgb_params <- xgb_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(
+    trees = trees(range = c(100, 1000)),
+    tree_depth = tree_depth(range = c(3, 10)),
+    min_n = min_n(range = c(2, 20)),            
+    learn_rate = learn_rate(range = c(-3, -1)),
+    loss_reduction = loss_reduction(range = c(-7, -2)),
+    sample_size = sample_prop(range = c(0.5, 1.0))
+  )
+
+# Create the workflow used for both trainers
+phasic_workflow <- workflow() %>% add_recipe(phasic_recipe) %>% add_model(xgb_spec)
+
+# Create cross-validation fold for both trainers
+set.seed(6297)
+phasic_cv <- vfold_cv(icoria_df, v = 10, strata = phasic_resid)
+
+```
+
+
+```{r model_tuning}
+
+# Tune models and save as cache
+phasic_tuned <- xgb_tuning(
+  phasic_workflow,
+  phasic_cv,
+  xgb_params,
+  here(model_folder, "phasic_icoria.rds")
+)
+
+# Select best parameters and create workflow
+phasic_params <- select_best(phasic_tuned, metric = "rmse")
+phasic_selected <- finalize_workflow(phasic_workflow, phasic_params)
+
+# Fit the final models
+xgb_phasic <- fit(phasic_selected, data = icoria_df)
+
+```
+
+
+```{r single_variable_plots}
+
+# Extract variable importance out into a table
+phasic_importance <- xgb_phasic %>% extract_fit_parsnip() %>% vi() %>% arrange(desc(Importance))
+
+# Plot out the variable importance graphs
+phasic_importance %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#4A148C", width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Variable Importance",
+    subtitle = "Gradient Boosting Model — Top 20 Features by Gain",
+    x = NULL,
+    y = "Importance (Gain)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", margin = margin(b = 5)),
+    plot.subtitle = element_text(hjust = 0.5, margin = margin(b = 10)),
+    panel.border = element_rect(color = "grey50", fill = NA, linewidth = 0.5),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Extract the fitted model from workflows
+phasic_fit <- extract_fit_parsnip(xgb_phasic)
+
+# Prep training data through the recipe
+phasic_baked <- phasic_recipe %>% prep() %>% bake(new_data = icoria_df)
+
+# Phasic PDP and ARS PDP
+features_voice <- c(
+  "avg_speaking_rate", "neutrality_pct", "avg_intonation_score",
+  "avg_loudness", "happiness_pct", "avg_estimated_age", "avg_male_confidence"
+)
+features_liwc <- c(
+  "Perception_EN", "Physical_EN", "Affect_EN", "Social_EN",
+  "Lifestyle_EN", "Authentic_EN", "Drives_EN", "Clout_EN", "Cognition_EN"
+)
+generate_pdp_plots(
+  phasic_fit,
+  phasic_baked,
+  "phasic_resid",
+  features_voice,
+  "#4A148C",
+  subtitle = "Effect of Voice Features on Residualized EDA"
+)
+generate_pdp_plots(
+  phasic_fit,
+  phasic_baked, 
+  "phasic_resid",
+  features_liwc,
+  "#4A148C",
+  subtitle = "Effect of Linguistic Features on Residualized EDA"
+)
+
+```
+
+
+```{r interaction_summary}
+
+# Extract interaction table
+xgb_phasic_engine <- extract_fit_engine(xgb_phasic)
+phasic_prepped <- prep(phasic_recipe) %>% bake(new_data = NULL) %>% select(-phasic_resid) %>% as.matrix()
+shap_phasic <- shapviz(xgb_phasic_engine, X_pred = phasic_prepped)
+shap_interact <- shapviz(xgb_phasic_engine, X_pred = phasic_prepped, interaction = TRUE)
+
+# Create the pairwise interaction table
+int_table <- get_interaction_table(shap_interact, phasic_prepped, top_n = 30)
+
+# Create cross-model interaction table
+voice_vars <- c(
+  "avg_speaking_rate", "avg_intonation_score", "avg_loudness",
+  "avg_male_confidence", "avg_estimated_age", "neutrality_pct", 
+  "happiness_pct"
+)
+liwc_vars <- c(
+  "Clout_EN", "Authentic_EN", "Drives_EN", "Cognition_EN",
+  "Affect_EN", "Social_EN", "Lifestyle_EN", "Physical_EN", 
+  "Perception_EN"
+)
+
+cross_modal <- int_table %>%
+  filter(
+    (Var1 %in% voice_vars & Var2 %in% liwc_vars) |
+    (Var1 %in% liwc_vars & Var2 %in% voice_vars)
+  )
+
+# Save the table into Word ready format
+cross_modal_table <- cross_modal %>%
+  head(20) %>%
+  mutate(
+    Rank = row_number(),
+    value = formatC(value, format = "f", digits = 6)
+  ) %>%
+  select(Rank, `Voice Feature` = Var1, `Linguistic Feature` = Var2, `Interaction Strength` = value)
+
+ft <- flextable(cross_modal_table) %>%
+  set_caption("Top 20 SHAP Interaction Effects") %>%
+  theme_booktabs() %>%
+  align(align = "center", part = "all") %>%
+  autofit()
+
+save_as_docx(ft, path = here(results_folder, "cross_modal_interactions_phasic.docx"))
+print(cross_modal)
+
+```
+
+
+```{r shap_dependence}
+
+plot_interaction_lines(
+  phasic_fit, phasic_baked, "phasic_resid",
+  "avg_speaking_rate", "Lifestyle_EN",
+  title = "Average Speaking Rate × Lifestyle"
+)
+
+plot_interaction_lines(
+  phasic_fit, phasic_baked, "phasic_resid",
+  "avg_estimated_age", "Lifestyle_EN",
+  title = "Average Estimated Age × Lifestyle"
+)
+
+plot_interaction_lines(
+  phasic_fit, phasic_baked, "phasic_resid",
+  "neutrality_pct", "Clout_EN",
+  title = "Neutrality Percentage × Clout"
+)
+
+plot_interaction_lines(
+  phasic_fit, phasic_baked, "phasic_resid",
+  "avg_intonation_score", "Lifestyle_EN",
+  title = "Average Intonation Score × Lifestyle"
+)
+
+plot_interaction_lines(
+  phasic_fit, phasic_baked, "phasic_resid",
+  "neutrality_pct", "Perception_EN",
+  title = "Neutrality Percentage × Perception"
+)
+
+```
+
+
+```{r happiness_neutrality}
+
+# doc <- read_docx()
+
+# happiness_pct × all LIWC features
+# doc <- doc %>% body_add_par("Happiness % × LIWC Features", style = "heading 1")
+
+for (feat in features_liwc) {
+  # tmp <- tempfile(fileext = ".png")
+  # png(tmp, width = 1200, height = 800, res = 150)
+  print(plot_interaction_lines(
+    phasic_fit, phasic_baked, "phasic_resid",
+    "happiness_pct", feat,
+    title = paste("Happiness % ×", feat)
+  ))
+  # dev.off()
+  # 
+  # doc <- doc %>%
+  #   body_add_par(paste("Happiness % ×", feat), style = "heading 2") %>%
+  #   body_add_img(tmp, width = 6, height = 4)
+}
+
+# # neutrality_pct × all LIWC features
+# doc <- doc %>% body_add_break() %>%
+#   body_add_par("Neutrality % × LIWC Features", style = "heading 1")
+# 
+for (feat in features_liwc) {
+  # tmp <- tempfile(fileext = ".png")
+  # png(tmp, width = 1200, height = 800, res = 150)
+  print(plot_interaction_lines(
+    phasic_fit, phasic_baked, "phasic_resid",
+    "neutrality_pct", feat,
+    title = paste("Neutrality % ×", feat)
+  ))
+  # dev.off()
+  # 
+  # doc <- doc %>%
+  #   body_add_par(paste("Neutrality % ×", feat), style = "heading 2") %>%
+  #   body_add_img(tmp, width = 6, height = 4)
+}
+# 
+# print(doc, target = here(results_folder, "happiness_neutrality_interactions_phasic.docx"))
+
+```
+
+
+```{r other_interactions}
+
+already_plotted_voice <- c("happiness_pct", "neutrality_pct")
+
+# Filter cross_modal for remaining pairs
+remaining <- cross_modal %>%
+  mutate(
+    voice = ifelse(Var1 %in% voice_vars, Var1, Var2),
+    liwc  = ifelse(Var1 %in% liwc_vars, Var1, Var2)
+  ) %>%
+  filter(!voice %in% already_plotted_voice)
+
+# Build the doc
+# doc <- read_docx()
+# doc <- doc %>% body_add_par("Remaining Cross-Modal Interactions (Phasic)", style = "heading 1")
+
+for (i in seq_len(nrow(remaining))) {
+  v <- remaining$voice[i]
+  l <- remaining$liwc[i]
+  print(
+    plot_interaction_lines(
+      phasic_fit, phasic_baked, "phasic_resid",
+      v, l,
+      title = paste(v, "×", l)
+    )
+  )
+  
+  # tmp <- tempfile(fileext = ".png")
+  # png(tmp, width = 1200, height = 800, res = 150)
+  # print(plot_interaction_lines(
+  #   phasic_fit, phasic_baked, "phasic_resid",
+  #   v, l,
+  #   title = paste(v, "×", l)
+  # ))
+  # dev.off()
+  # 
+  # doc <- doc %>%
+  #   body_add_par(paste(v, "×", l), style = "heading 2") %>%
+  #   body_add_img(tmp, width = 6, height = 4)
+}
+
+# print(doc, target = here(results_folder, "cross_modal_interactions_phasic.docx"))
+
+```
+
